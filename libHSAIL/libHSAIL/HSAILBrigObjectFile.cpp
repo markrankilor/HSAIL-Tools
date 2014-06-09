@@ -187,7 +187,7 @@ public:
                           << elfHeader.e_type
                           << ", machine = "
                           << elfHeader.e_machine << std::endl;
-								return 1;
+                return 1;
             }
         }
         sectionHeaders.resize(elfHeader.e_shnum);
@@ -602,23 +602,23 @@ int BrigIO::load(BrigContainer &dst,
 {
     unsigned char ident[16];
     if (!(src.pread((char*)ident, 16, 0))) {
-			switch(ident[EI_CLASS]) {
-			case ELFCLASS32: {
-					BrigIOImpl<Elf32Policy> impl(fmt);
-					return impl.readContainer(dst, &src);
-					}
-			case ELFCLASS64: {
-					BrigIOImpl<Elf64Policy> impl(fmt);
-					return impl.readContainer(dst, &src);
-					}
-			default:
-					src.errs << "Invalid ELFCLASS" << std::endl;
-					return 1;
-			}
-		} else {
+      switch(ident[EI_CLASS]) {
+      case ELFCLASS32: {
+          BrigIOImpl<Elf32Policy> impl(fmt);
+          return impl.readContainer(dst, &src);
+          }
+      case ELFCLASS64: {
+          BrigIOImpl<Elf64Policy> impl(fmt);
+          return impl.readContainer(dst, &src);
+          }
+      default:
+          src.errs << "Invalid ELFCLASS" << std::endl;
+          return 1;
+      }
+    } else {
       src.errs << std::endl;
-			return 1;
-		}
+      return 1;
+    }
 }
 
 int BrigIO::save(BrigContainer &src, 
