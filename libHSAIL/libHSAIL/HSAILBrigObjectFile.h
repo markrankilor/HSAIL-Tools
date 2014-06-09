@@ -185,6 +185,12 @@ public: // Elf emitting
 
 public: // Elf reading
 
+    static int load(BrigContainer &c, const char *buf, size_t size,
+			std::ostream& sErrStream) {
+				return BrigIO::load(c, FORMAT, BrigIO::memoryReadingAdapter(buf, size,
+					sErrStream));
+		}
+
     static int load(BrigContainer &c, const char *buf, size_t size) {
         return BrigIO::load(c, FORMAT, BrigIO::memoryReadingAdapter(buf, size));
     }
