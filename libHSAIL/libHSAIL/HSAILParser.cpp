@@ -1,36 +1,36 @@
 // University of Illinois/NCSA
 // Open Source License
-// 
+//
 // Copyright (c) 2013, Advanced Micro Devices, Inc.
 // All rights reserved.
-// 
+//
 // Developed by:
-// 
+//
 //     HSA Team
-// 
+//
 //     Advanced Micro Devices, Inc
-// 
+//
 //     www.amd.com
-// 
+//
 // Permission is hereby granted, free of charge, to any person obtaining a copy of
 // this software and associated documentation files (the "Software"), to deal with
 // the Software without restriction, including without limitation the rights to
 // use, copy, modify, merge, publish, distribute, sublicense, and/or sell copies
 // of the Software, and to permit persons to whom the Software is furnished to do
 // so, subject to the following conditions:
-// 
+//
 //     * Redistributions of source code must retain the above copyright notice,
 //       this list of conditions and the following disclaimers.
-// 
+//
 //     * Redistributions in binary form must reproduce the above copyright notice,
 //       this list of conditions and the following disclaimers in the
 //       documentation and/or other materials provided with the distribution.
-// 
+//
 //     * Neither the names of the LLVM Team, University of Illinois at
 //       Urbana-Champaign, nor the names of its contributors may be used to
 //       endorse or promote products derived from this Software without specific
 //       prior written permission.
-// 
+//
 // THE SOFTWARE IS PROVIDED "AS IS", WITHOUT WARRANTY OF ANY KIND, EXPRESS OR
 // IMPLIED, INCLUDING BUT NOT LIMITED TO THE WARRANTIES OF MERCHANTABILITY, FITNESS
 // FOR A PARTICULAR PURPOSE AND NONINFRINGEMENT.  IN NO EVENT SHALL THE
@@ -53,7 +53,7 @@ using namespace std;
 struct DeclPrefix
 {
     Optional<bool>                 hasConst;
-    Optional<unsigned>             align;
+    Optional<Brig::BrigAlignment>  align;
     Optional<Brig::BrigLinkage8_t> linkage;
 };
 
@@ -219,6 +219,23 @@ Optional<Brig::BrigWidth8_t> tryParseWidthModifier(Scanner& scanner) {
     return res;
 }
 
+Optional<Brig::BrigAlignment8_t> tryParseAlignModifier(Scanner& scanner) {
+    Optional<Brig::BrigAlignment8_t> res;
+    if (scanner.token() == EMAlign) {
+        scanner.scan();
+        scanner.eatToken(ELParen);
+
+        res = num2align(readInt<Brig::BRIG_TYPE_U32>(scanner));
+        if (res == Brig::BRIG_ALIGNMENT_NONE) {
+            scanner.syntaxError("Invalid alignment");
+        }
+
+        scanner.expect(ERParen);
+        scanner.scanModifier();
+    }
+    return res;
+}
+
 Optional<unsigned> tryParseEquiv(Scanner& scanner) {
     Optional<unsigned> equivClass;
     if (scanner.token() == EMEquiv) {
@@ -234,21 +251,34 @@ Optional<unsigned> tryParseEquiv(Scanner& scanner) {
     return equivClass;
 }
 
-Inst parseMnemoBasic(Scanner& scanner, Brigantine& bw) {
+Inst parseMnemoBasic(Scanner& scanner, Brigantine& bw, bool expectType) {
     assert(scanner.token()==EInstruction);
     unsigned const opCode = scanner.brigId();
     scanner.scanModifier();
 
-    //dp Optional<unsigned> const type    = scanner.eatModifier(EMType);
     Optional<unsigned> type;
-    if (opCode != Brig::BRIG_OPCODE_RET) type = scanner.eatModifier(EMType); //dp
+    if (expectType) type = scanner.eatModifier(EMType);
 
     scanner.expect(EMNone); // parse done
 
+    if (opCode == Brig::BRIG_OPCODE_CODEBLOCKEND) {
+        scanner.syntaxError("Instruction codeblockend is not allowed in HSAIL code");
+    }
     InstBasic inst = bw.addInst<InstBasic>(opCode);
     inst.type() = type.isInitialized() ? Brig::BrigTypeX(type.value()) : Brig::BRIG_TYPE_NONE;
     return inst;
 }
+
+Inst parseMnemoBasic(Scanner& scanner, Brigantine& bw) {
+    return parseMnemoBasic(scanner,bw,true);
+}
+
+Inst parseMnemoBasicNoType(Scanner& scanner, Brigantine& bw) {
+    Inst res = parseMnemoBasic(scanner,bw,false);
+    if (isGcnInst(res.opcode())) res.type() = Brig::BRIG_TYPE_B32; // default type for GCN
+    return res;
+}
+
 
 Inst parseMnemoBasicOrMod(Scanner& scanner, Brigantine& bw) {
     assert(scanner.token()==EInstruction);
@@ -264,9 +294,12 @@ Inst parseMnemoBasicOrMod(Scanner& scanner, Brigantine& bw) {
     if (ftz.isInitialized() || round.isInitialized() || packing.isInitialized()) {
         InstMod inst = bw.addInst<InstMod>(opCode);
         inst.modifier().ftz() = ftz.isInitialized();
-        inst.modifier().round() = round.isInitialized() ? round.value() : getDefRounding(opCode,type);
         inst.pack() = packing.isInitialized() ? Brig::BrigPack(packing.value()) : Brig::BRIG_PACK_NONE;
         inst.type() = type;
+
+        // NB: getDefRounding must be called after all other fields are initialized
+        inst.modifier().round() = round.isInitialized() ? round.value() : getDefRounding(inst);
+
         return inst;
     } else {
         InstBasic inst = bw.addInst<InstBasic>(opCode);
@@ -304,14 +337,12 @@ Inst parseMnemoSeg(Scanner& scanner, Brigantine& bw) {
     scanner.scanModifier();
 
     Optional<unsigned> const segment = scanner.tryEatModifier(EMSegment);
-              unsigned const   dtype = scanner.eatModifier(EMType);
-    Optional<unsigned> const   stype = scanner.tryEatModifier(EMType);
+              unsigned const   type = scanner.eatModifier(EMType);
     scanner.expect(EMNone); // parse done
 
     InstSeg inst = bw.addInst<InstSeg>(opCode);
-    inst.sourceType() = stype.isInitialized() ? Brig::BrigTypeX(stype.value()) : Brig::BRIG_TYPE_NONE;
     inst.segment() = segment.isInitialized()  ? Brig::BrigSegment(segment.value()) : Brig::BRIG_SEGMENT_FLAT;
-    inst.type() = dtype;
+    inst.type() = type;
     return inst;
 }
 
@@ -325,37 +356,37 @@ Inst parseMnemoAddr(Scanner& scanner, Brigantine& bw) {
     scanner.expect(EMNone); // parse done
 
     InstAddr inst = bw.addInst<InstAddr>(opCode);
-    inst.segment() = segment.isInitialized() ? segment : Brig::BRIG_SEGMENT_FLAT;
+    inst.segment() = segment.isInitialized() ?
+                        segment :
+                        isGcnInst(inst.opcode())? Brig::BRIG_SEGMENT_EXTSPACE0 : Brig::BRIG_SEGMENT_FLAT;
     inst.type() = type;
     return inst;
 }
-
 
 Inst parseMnemoMem(Scanner& scanner, Brigantine& bw, int* outVector/* out */) {
     assert(scanner.token()==EInstruction || scanner.token()==EInstruction_Vx);
     unsigned const opCode = scanner.brigId();
     scanner.scanModifier();
 
-    Optional<unsigned>           const vector     = scanner.tryEatModifier(EMVector);
-    Optional<Brig::BrigWidth8_t> const width      = tryParseWidthModifier(scanner);
-    Optional<unsigned>           const segment    = scanner.tryEatModifier(EMSegment);
-    Optional<unsigned>           const aligned    = scanner.tryEatModifier(EMAligned);
-    Optional<unsigned>           const semantic   = scanner.tryEatModifier(EMSemantics);
-    Optional<unsigned>           const equivClass = tryParseEquiv(scanner);
-    unsigned                     const type       = scanner.eatModifier(EMType);
+    Optional<unsigned>               const vector  = scanner.tryEatModifier(EMVector);
+    Optional<unsigned>               const segment = scanner.tryEatModifier(EMSegment);
+    Optional<Brig::BrigAlignment8_t> const align   = tryParseAlignModifier(scanner);
+    Optional<unsigned>               const isConst = scanner.tryEatModifier(EMConst);
+
+    if (scanner.token() == EMEquiv && opCode == Brig::BRIG_OPCODE_ALLOCA) scanner.syntaxError("equiv modifier is not supported");
+
+    Optional<unsigned>               const equivClass = tryParseEquiv(scanner);
+    Optional<Brig::BrigWidth8_t>     const width      = tryParseWidthModifier(scanner);
+    unsigned                         const type       = scanner.eatModifier(EMType);
     scanner.expect(EMNone); // parse done
 
     InstMem inst = bw.addInst<InstMem>(opCode);
     inst.type()       = type;
     inst.segment()    = segment.isInitialized() ?    Brig::BrigSegment(segment.value())    : Brig::BRIG_SEGMENT_FLAT;
     inst.equivClass() = equivClass.isInitialized() ? equivClass.value() : 0;
-    //dp inst.width()      = width.isInitialized() ?      width.value()      : Brig::BRIG_WIDTH_NONE;
     inst.width()      = width.isInitialized() ?      width.value()      : getDefWidth(inst);
-    inst.modifier().aligned()  = aligned.isInitialized();
-    inst.modifier().semantic() = semantic.isInitialized() ? Brig::BrigMemorySemantic(semantic.value()) :
-                                    (doesSupportMemorySemantic(opCode) ?
-                                        Brig::BRIG_SEMANTIC_REGULAR :
-                                        Brig::BRIG_SEMANTIC_NONE);
+    inst.align()      = align.isInitialized() ?      align.value()      : Brig::BRIG_ALIGNMENT_1;
+    inst.modifier().isConst()  = isConst.isInitialized();
 
     if (outVector!=NULL) {
         *outVector = vector.isInitialized() ? vector.value() : 1;
@@ -371,17 +402,32 @@ Inst parseMnemoBr(Scanner& scanner, Brigantine& bw) {
     assert(scanner.token()==EInstruction);
     unsigned const opCode = scanner.brigId();
     scanner.scanModifier();
+
+    if (scanner.token() == EMWidth && opCode == Brig::BRIG_OPCODE_WAVEBARRIER) scanner.syntaxError("width modifier is not supported");
+
     Optional<Brig::BrigWidth8_t> const width = tryParseWidthModifier(scanner);
     scanner.expect(EMNone); // parse done
 
     InstBr inst = bw.addInst<InstBr>(opCode,Brig::BRIG_TYPE_NONE);
 
-    //dp FIXME: could it be improved?
-    //dp: should initialize width using getDefWidth, but it is only possible after parsing branch/call args
-    inst.width() = width.isInitialized() ? Brig::BrigWidth(width.value()) : Brig::BRIG_WIDTH_NONE; // dp: will be fixed later, after parsing operands
+    if (width.isInitialized())
+    {
+        inst.width() = Brig::BrigWidth(width.value());
+    }
+    else if (inst.opcode() == Brig::BRIG_OPCODE_BRN || 
+             inst.opcode() == Brig::BRIG_OPCODE_CBR || 
+             inst.opcode() == Brig::BRIG_OPCODE_CALL)  
+    {
+        // should initialize width using getDefWidth, 
+        // but it is only possible after parsing branch/call args.
+        // This will be fixed later, after parsing operands
+        inst.width() = Brig::BRIG_WIDTH_NONE;
+    }
+    else
+    {
+        inst.width() = getDefWidth(inst);
+    }
 
-
-    // TBD095 why modifier? its not used
     return inst;
 }
 
@@ -419,66 +465,60 @@ Inst parseMnemoCvt(Scanner& scanner, Brigantine& bw) {
     InstCvt inst = bw.addInst<InstCvt>(opCode,dstType);
     inst.sourceType()       = srcType;
     inst.modifier().ftz()   = ftz.isInitialized();
-    inst.modifier().round() = round.isInitialized() ? round.value() : getDefRoundingForCvt(srcType,dstType);
+    
+    // NB: getDefRounding must be called after all other fields are initialized
+    inst.modifier().round() = round.isInitialized() ? round.value() : getDefRounding(inst);
+
     return inst;
 }
 
 Inst parseMnemoAtomic(Scanner& scanner, Brigantine& bw) {
     assert(scanner.token()==EInstruction);
     unsigned const opCode = scanner.brigId();
+    scanner.setContext(Brig::BRIG_INST_ATOMIC);
     scanner.scanModifier();
 
     unsigned           const atomicOperation = scanner.eatModifier(EMAtomicOp);
     Optional<unsigned> const segment         = scanner.tryEatModifier(EMSegment);
-    Optional<unsigned> const memorySemantic  = scanner.tryEatModifier(EMSemantics);
+    unsigned           const memoryOrder     = scanner.eatModifier(EMMemoryOrder);
+    unsigned           const memoryScope     = scanner.eatModifier(EMMemoryScope);
+    Optional<unsigned> const equivClass      = tryParseEquiv(scanner);
     unsigned           const type            = scanner.eatModifier(EMType);
     scanner.expect(EMNone); // parse done
 
     InstAtomic inst = bw.addInst<InstAtomic>(opCode,type);
     inst.atomicOperation() = atomicOperation;
     inst.segment()         = segment.isInitialized() ? Brig::BrigSegment(segment.value()) : Brig::BRIG_SEGMENT_FLAT;
-    inst.memorySemantic()  = memorySemantic.isInitialized() ? Brig::BrigMemorySemantic(memorySemantic.value()) : Brig::BRIG_SEMANTIC_REGULAR;
+    inst.equivClass()      = equivClass.isInitialized() ? equivClass.value() : 0;
+    inst.memoryOrder()     = memoryOrder;
+    inst.memoryScope()     = memoryScope;
     return inst;
 }
 
-Inst parseMnemoBar(Scanner& scanner, Brigantine& bw) {
+Inst parseMnemoMemFence(Scanner& scanner, Brigantine& bw) {
     assert(scanner.token()==EInstruction);
     unsigned const opCode = scanner.brigId();
     scanner.scanModifier();
 
-    Optional<Brig::BrigWidth8_t> const width = tryParseWidthModifier(scanner);
-    Optional<unsigned>           const fence = scanner.tryEatModifier(EMMemoryFence);
+    Optional<unsigned> const segment = scanner.tryEatModifier(EMSegment);
+    unsigned const memoryOrder = scanner.eatModifier(EMMemoryOrder);
+    unsigned const memoryScope = scanner.eatModifier(EMMemoryScope);
+
     scanner.expect(EMNone); // parse done
 
-    InstBar inst = bw.addInst<InstBar>(opCode,Brig::BRIG_TYPE_NONE);
+    InstMemFence inst = bw.addInst<InstMemFence>(opCode,Brig::BRIG_TYPE_NONE);
 
-    inst.width()       = width.isInitialized() ? width.value() : getDefWidth(inst);  // dp
-    inst.memoryFence() = fence.isInitialized() ? fence.value() : getDefFence(opCode);
-    return inst;
-}
-
-Inst parseMnemoFbar(Scanner& scanner, Brigantine& bw) {
-    assert(scanner.token()==EInstruction);
-    unsigned const opCode = scanner.brigId();
-    scanner.scanModifier();
-
-    Optional<Brig::BrigWidth8_t> const width = tryParseWidthModifier(scanner);
-    Optional<unsigned>           fence;
-
-    // Only these instructions support 'fence' modifier
-    // It is important to detect unsupported modifiers for other instructions, because, for example,
-    // 'initfbar_fnone' is not valid, but in BRIG 'fnone' is a valid fence value
-    if (opCode == Brig::BRIG_OPCODE_WAITFBAR || opCode == Brig::BRIG_OPCODE_ARRIVEFBAR)
-    {
-        fence = scanner.tryEatModifier(EMMemoryFence);
+    if (!segment.isInitialized()) {
+      inst.segments() = Brig::BRIG_MEMORY_FENCE_BOTH;
+    } else if (segment.value() == Brig::BRIG_SEGMENT_GLOBAL) {
+      inst.segments() = Brig::BRIG_MEMORY_FENCE_GLOBAL;
+    } else if (segment.value() == Brig::BRIG_SEGMENT_GROUP) { 
+      inst.segments() = Brig::BRIG_MEMORY_FENCE_GROUP;
+    } else {
+      scanner.syntaxError("Invalid segment for memory fence");
     }
-
-    scanner.expect(EMNone); // parse done
-
-    InstFbar inst = bw.addInst<InstFbar>(opCode,Brig::BRIG_TYPE_NONE);
-
-    inst.width()       = width.isInitialized() ? width.value() : getDefWidth(inst);
-    inst.memoryFence() = fence.isInitialized() ? fence.value() : getDefFence(opCode);
+    inst.memoryOrder() = memoryOrder;
+    inst.memoryScope() = memoryScope;
     return inst;
 }
 
@@ -492,36 +532,58 @@ Inst parseMnemoImage(Scanner& scanner, Brigantine& bw) {
         scanner.syntaxError("only v4 vector allowed");
     }
 
-    unsigned const geom      = scanner.eatModifier(EMGeom);
-    unsigned const dstType   = scanner.eatModifier(EMType);
-    unsigned const imgType   = scanner.eatModifier(EMType);
-    unsigned const coordType = scanner.eatModifier(EMType);
+    unsigned           const geom       = scanner.eatModifier(EMGeom);
+    Optional<unsigned> const equivClass = tryParseEquiv(scanner);
+    unsigned           const dstType    = scanner.eatModifier(EMType);
+    unsigned           const imgType    = scanner.eatModifier(EMType);
+    unsigned           const coordType  = scanner.eatModifier(EMType);
     scanner.expect(EMNone); // parse done
 
-    InstImage inst = bw.addInst<InstImage>(opCode,dstType);
-    inst.geometry()  = geom;
-    inst.imageType() = imgType;
-    inst.coordType() = coordType;
+    InstImage inst    = bw.addInst<InstImage>(opCode,dstType);
+    inst.equivClass() = equivClass.isInitialized() ? equivClass.value() : 0;
+    inst.geometry()   = geom;
+    inst.imageType()  = imgType;
+    inst.coordType()  = coordType;
     return inst;
 }
 
 Inst parseMnemoAtomicImage(Scanner& scanner, Brigantine& bw) {
     assert(scanner.token()==EInstruction);
     unsigned const opCode = scanner.brigId();
+    scanner.setContext(Brig::BRIG_INST_ATOMIC);
     scanner.scanModifier();
 
-    unsigned const atomicOperation = scanner.eatModifier(EMAtomicOp);
-    unsigned const geom            = scanner.eatModifier(EMGeom);
-    unsigned const dstType         = scanner.eatModifier(EMType);
-    unsigned const imgType         = scanner.eatModifier(EMType);
-    unsigned const coordType       = scanner.eatModifier(EMType);
+    unsigned           const atomicOperation = scanner.eatModifier(EMAtomicOp);
+    unsigned           const geom            = scanner.eatModifier(EMGeom);
+    Optional<unsigned> const equivClass      = tryParseEquiv(scanner);
+    unsigned           const dstType         = scanner.eatModifier(EMType);
+    unsigned           const imgType         = scanner.eatModifier(EMType);
+    unsigned           const coordType       = scanner.eatModifier(EMType);
     scanner.expect(EMNone); // parse done
 
-    InstAtomicImage inst = bw.addInst<InstAtomicImage>(opCode,dstType);
+    InstAtomicImage inst   = bw.addInst<InstAtomicImage>(opCode,dstType);
+    inst.equivClass()      = equivClass.isInitialized() ? equivClass.value() : 0;
     inst.atomicOperation() = atomicOperation;
     inst.geometry()        = geom;
     inst.imageType()       = imgType;
     inst.coordType()       = coordType;
+    return inst;
+}
+
+Inst parseMnemoLane(Scanner& scanner, Brigantine& bw) {
+    assert(scanner.token()==EInstruction);
+    unsigned const opCode = scanner.brigId();
+    scanner.scanModifier();
+
+    Optional<Brig::BrigWidth8_t> const width = tryParseWidthModifier(scanner);
+              unsigned const   dtype = scanner.eatModifier(EMType);
+    Optional<unsigned> const   stype = scanner.tryEatModifier(EMType);
+    scanner.expect(EMNone); // parse done
+
+    InstLane inst = bw.addInst<InstLane>(opCode);
+    inst.sourceType() = stype.isInitialized() ? stype.value() : Brig::BRIG_TYPE_NONE;
+    inst.width() = width.isInitialized() ? width.value() : getDefWidth(inst);
+    inst.type() = dtype;
     return inst;
 }
 
@@ -532,6 +594,64 @@ Inst parseMnemoNop(Scanner& scanner, Brigantine& bw) {
     inst.type() = Brig::BRIG_TYPE_NONE;
     return inst;
 }
+
+Inst parseMnemoQueue(Scanner& scanner, Brigantine& bw) {
+    assert(scanner.token()==EInstruction);
+    unsigned const opCode = scanner.brigId();
+    scanner.scanModifier();
+
+    Optional<unsigned> const segment = scanner.tryEatModifier(EMSegment);
+    unsigned const memoryOrder       = scanner.eatModifier(EMMemoryOrder);
+    unsigned const type              = scanner.eatModifier(EMType);
+    scanner.expect(EMNone); // parse done
+
+    InstQueue inst = bw.addInst<InstQueue>(opCode);
+    inst.segment() = segment.isInitialized()  ? Brig::BrigSegment(segment.value()) : Brig::BRIG_SEGMENT_FLAT;
+    inst.memoryOrder() = memoryOrder;
+    inst.type() = type;
+    return inst;
+}
+
+Inst parseMnemoSignal(Scanner& scanner, Brigantine& bw) {
+    assert(scanner.token()==EInstruction);
+    unsigned const opCode = scanner.brigId();
+
+    scanner.setContext(Brig::BRIG_INST_SIGNAL);
+    scanner.scanModifier();
+
+    unsigned const signalOperation = scanner.eatModifier(EMSignalOp);
+    unsigned const memoryOrder       = scanner.eatModifier(EMMemoryOrder);
+    unsigned const type              = scanner.eatModifier(EMType);
+    unsigned const signalType        = scanner.eatModifier(EMType);
+    scanner.expect(EMNone); // parse done
+
+    InstSignal inst = bw.addInst<InstSignal>(opCode);
+    inst.signalOperation() = signalOperation;
+    inst.memoryOrder() = memoryOrder;
+    inst.type() = type;
+    inst.signalType() = signalType;
+    return inst;
+}
+
+Inst parseMnemoSegCvt(Scanner& scanner, Brigantine& bw) {
+    assert(scanner.token()==EInstruction);
+    unsigned const opCode = scanner.brigId();
+    scanner.scanModifier();
+
+    Optional<unsigned> const segment = scanner.tryEatModifier(EMSegment);
+    Optional<unsigned> const isNoNull = scanner.tryEatModifier(EMNoNull);
+              unsigned const   dtype = scanner.eatModifier(EMType);
+    Optional<unsigned> const   stype = scanner.tryEatModifier(EMType);
+    scanner.expect(EMNone); // parse done
+
+    InstSegCvt inst = bw.addInst<InstSegCvt>(opCode);
+    inst.sourceType() = stype.isInitialized() ? Brig::BrigTypeX(stype.value()) : Brig::BRIG_TYPE_NONE;
+    inst.segment() = segment.isInitialized()  ? Brig::BrigSegment(segment.value()) : Brig::BRIG_SEGMENT_FLAT;
+    inst.modifier().isNoNull() = isNoNull.isInitialized();
+    inst.type() = dtype;
+    return inst;
+}
+
 
 /*
 Inst parseMnemoInstLdSt(Scanner& scanner, Brigantine& bw) {
@@ -654,10 +774,10 @@ void Parser::parseVersion()
 
     SourceInfo const srcInfo = tokenSourceInfo();
     eatToken(EKWVersion);
-    uint16_t const major = readNonNegativeInt<Brig::BRIG_TYPE_U16>(m_scanner);
+    uint32_t const major = readNonNegativeInt<Brig::BRIG_TYPE_U32>(m_scanner);
 
     eatToken(EColon);
-    uint16_t const minor = readNonNegativeInt<Brig::BRIG_TYPE_U16>(m_scanner);
+    uint32_t const minor = readNonNegativeInt<Brig::BRIG_TYPE_U32>(m_scanner);
 
     Optional<Brig::BrigProfile8_t>      profile;
     Optional<Brig::BrigMachineModel8_t> machineModel;
@@ -710,11 +830,11 @@ void Parser::parseTopLevelStatement()
     case EKWFunction:     parseFunction(); break;
     case EKWSignature:    parseSignature(); break;
     case EKWExtension:    parseExtension();break;
-    case EKWFile:         parseFileDecl();break;
     case EKWPragma:       parsePragma();break;
     case EKWBlockStart:   parseBlock();break;
     case EKWFbarrier:     parseFbarrier(false);break;
     case EControl:        parseControl();break;
+    case EKWLoc:          parseLocation(); break;
     default:
         if (IsDeclStart(token())) {
             DeclPrefix const declPfx = parseDeclPrefix();
@@ -850,7 +970,7 @@ void Parser::parseFunction(const DeclPrefix* declPrefix)
         parseCodeBlock();
     } else {
         func.firstScopedDirective() = m_bw.container().directives().end();
-        func.modifier().isDeclaration() = true; //dp
+        func.modifier().isDeclaration() = true;
     }
 
     eatToken(ESemi);
@@ -861,11 +981,7 @@ void Parser::parseSigArgs(Scanner& s,DirectiveSignatureArguments types, Directiv
     eatToken(ELParen);
     if (token()!=ERParen) {
         do {
-            uint8_t align;
-            {
-                DeclPrefix const declPfx = parseDeclPrefix();
-                align = declPfx.align.isInitialized() ? declPfx.align.value() : 0;
-            }
+            DeclPrefix const declPfx = parseDeclPrefix();
 
             expect(ESegment);
             unsigned const segment = m_scanner.brigId();
@@ -885,6 +1001,9 @@ void Parser::parseSigArgs(Scanner& s,DirectiveSignatureArguments types, Directiv
                 dim = token() != ERBrace ? readPositiveInt<Brig::BRIG_TYPE_U64>(m_scanner) : 0;
                 eatToken(ERBrace);
             }
+
+            Brig::BrigAlignment align = declPfx.align.isInitialized() ? declPfx.align.value() : getNaturalAlignment(dType);
+
             types.addArg(argKind,dType,dim,align);
         } while (tryEatToken(EComma));
     }
@@ -944,7 +1063,7 @@ int Parser::parseBodyStatement()
     case EKWBlockStart:    parseBlock();break;
     case EControl:         parseControl();break;
     case EKWFbarrier:      parseFbarrier(true);break;
-    case EKWLabelTargets:  syntaxError("labeltargets should follow label"); break;
+    case EKWLabelTargets:  parseLabelTargets(); break;
     case ELCurl:           numInsts += parseArgScope(); break;
     case EInstruction:
     case EInstruction_Vx:
@@ -1001,19 +1120,29 @@ void Parser::parseLabel()
     SRef const name = m_scanner.readStringValue();
     eatToken(EColon);
 
-    if (!tryEatToken(EKWLabelTargets)) {
-        m_bw.addLabel(name,&srcInfo);
-    } else {
-        SourceInfo const srcInfo = tokenSourceInfo();
-        DirectiveLabelList list = m_bw.createLabelTargets(name,&srcInfo);
-        do {
-            parseLabelList(list.labels(),0);
-            eatToken(ESemi);
-        } while (tryEatToken(EKWLabelTargets));
-    }
+    m_bw.addLabel(name,&srcInfo);
 }
 
-unsigned Parser::parseLabelList(LabelList list, unsigned expectedSize)
+void Parser::parseLabelTargets() {
+    PDBG;
+    SourceInfo const srcInfo = tokenSourceInfo();
+    eatToken(EKWLabelTargets);
+
+    expect(EIDLocal);
+    SRef const name = m_scanner.readStringValue();
+
+    eatToken(EEqual);
+    eatToken(ELCurl);
+    DirectiveLabelTargets list = m_bw.createLabelTargets(name,&srcInfo);
+
+    parseLabelList(list.labels(),0);
+
+    eatToken(ERCurl);
+    eatToken(ESemi);
+}
+
+template <typename List>
+unsigned Parser::parseLabelList(List list, unsigned expectedSize)
 {
     unsigned numRead = 0;
     do {
@@ -1054,8 +1183,6 @@ public:
             }
             m_data.push_back(readValueIncludingPacked<BrigType,ConvertImmediate>(m_scanner));
         } while(m_scanner.tryEatToken(EComma));
-        while (m_data.numElements<CType>() < m_expElements)
-          m_data.push_back(0);
         return static_cast<unsigned>(m_data.numElements<CType>() - numElementsBefore);
     }
 
@@ -1080,7 +1207,7 @@ Directive Parser::parseVariableInitializer(Brig::BrigType16_t type, bool asArray
         if ( m_bw.localScope()==NULL ) {
             syntaxError("label initializers can be placed only inside func/kernel body definition");
         }
-        DirectiveLabelInit init = m_bw.createLabelInitList(&srcInfo);
+        DirectiveLabelInit init = m_bw.createLabelInit(&srcInfo);
         init.elementCount() = parseLabelList(init.labels(),expectedSize);
         res = init;
     } else {
@@ -1129,6 +1256,13 @@ DirectiveImageInit Parser::parseImageInitializer()
             }
             init.depth() = readPositiveInt<Brig::BRIG_TYPE_U32>(m_scanner);
             break;
+        case EKWImageArray:
+            scan(); // regular token follows
+            if (0 != init.array()) {
+                syntaxError("Array already set");
+            }
+            init.array() = readPositiveInt<Brig::BRIG_TYPE_U32>(m_scanner);
+            break;
         case EKWImageFormat:
             if (init.format() != Brig::BRIG_FORMAT_UNKNOWN) {
                 syntaxError("Format already set");
@@ -1143,11 +1277,44 @@ DirectiveImageInit Parser::parseImageInitializer()
             init.order() = m_scanner.scanImageOrder();
             scan(); // fwd scan
             break;
+        case EKWImageGeometry:
+            if (init.geometry() != Brig::BRIG_GEOMETRY_UNKNOWN) {
+                syntaxError("Geometry already set");
+            }
+            init.geometry() = m_scanner.scanImageGeometry();
+            scan(); // fwd scan
+            break;
         default:
             syntaxError("Invalid image property name",&srcInfo);
         }
     } while (tryEatToken(EComma));
     eatToken(ERCurl);
+
+    if (init.geometry() == Brig::BRIG_GEOMETRY_UNKNOWN) syntaxError("Missing image geometry", &srcInfo);
+    if (init.order()    == Brig::BRIG_ORDER_UNKNOWN)    syntaxError("Missing image order",    &srcInfo);
+    if (init.format()   == Brig::BRIG_FORMAT_UNKNOWN)   syntaxError("Missing image format",   &srcInfo);
+    if (init.width()    == 0)                           syntaxError("Missing image width",    &srcInfo);
+
+    unsigned geom = init.geometry();
+
+    if (geom == Brig::BRIG_GEOMETRY_2D || geom == Brig::BRIG_GEOMETRY_3D || geom == Brig::BRIG_GEOMETRY_2DA) {
+        if (init.height() == 0) syntaxError("Missing image height", &srcInfo);
+    } else {
+        if (init.height() > 0) syntaxError("Image height cannot be specified for this image geometry", &srcInfo);
+    }
+
+    if (geom == Brig::BRIG_GEOMETRY_3D) {
+        if (init.depth() == 0) syntaxError("Missing image depth", &srcInfo);
+    } else {
+        if (init.depth() > 0) syntaxError("Image depth cannot be specified for this image geometry", &srcInfo);
+    }
+
+    if (geom == Brig::BRIG_GEOMETRY_1DA || geom == Brig::BRIG_GEOMETRY_2DA) {
+        if (init.array() == 0) syntaxError("Missing image array", &srcInfo);
+    } else {
+        if (init.array() > 0) syntaxError("Image array cannot be specified for this image geometry", &srcInfo);
+    }
+
     return init;
 }
 
@@ -1203,13 +1370,13 @@ DirectiveSamplerInit Parser::parseSamplerInitializer()
         }
         switch(prop) {
         case EKWSamplerBoundaryU:
-            syntaxError("boundaryU value missing");
+            syntaxError("boundaryu value missing");
             break;
         case EKWSamplerBoundaryV:
-            syntaxError("boundaryV value missing");
+            syntaxError("boundaryv value missing");
             break;
         case EKWSamplerBoundaryW:
-            syntaxError("boundaryW value missing");
+            syntaxError("boundaryw value missing");
             break;
         case EKWSamplerCoord:
             syntaxError("coord value missing");
@@ -1241,7 +1408,10 @@ DeclPrefix Parser::parseDeclPrefix()
                 syntaxError("only one align modificator is allowed");
             }
             scan();
-            res.align = readPositiveInt<Brig::BRIG_TYPE_U16>(m_scanner);
+            res.align = num2align(readPositiveInt<Brig::BRIG_TYPE_U16>(m_scanner));
+            if (res.align==Brig::BRIG_ALIGNMENT_NONE) {
+                syntaxError("invalid alignment value");
+            }
             break;
         case EAttribute:
             if (res.linkage.isInitialized()) {
@@ -1257,14 +1427,14 @@ DeclPrefix Parser::parseDeclPrefix()
     return res;
 }
 
-DirectiveSymbol Parser::parseDecl(bool isArg, bool isLocal)
+DirectiveVariable Parser::parseDecl(bool isArg, bool isLocal)
 {
     PDBG;
     DeclPrefix const declPfx = parseDeclPrefix();
     return parseDecl(isArg,isLocal,declPfx);
 }
 
-DirectiveSymbol Parser::parseDecl(bool isArg, bool isLocal,const DeclPrefix& declPfx)
+DirectiveVariable Parser::parseDecl(bool isArg, bool isLocal,const DeclPrefix& declPfx)
 {
     SourceInfo const srcInfo = tokenSourceInfo();
     expect(ESegment);
@@ -1278,7 +1448,7 @@ DirectiveSymbol Parser::parseDecl(bool isArg, bool isLocal,const DeclPrefix& dec
     expect(isLocal ? EIDLocal : EIDStatic);
     SRef const name = m_scanner.readStringValue();
 
-    DirectiveSymbol sym;
+    DirectiveVariable sym;
     switch(dType) {
     case Brig::BRIG_TYPE_ROIMG:
     case Brig::BRIG_TYPE_RWIMG:
@@ -1288,15 +1458,11 @@ DirectiveSymbol Parser::parseDecl(bool isArg, bool isLocal,const DeclPrefix& dec
     case Brig::BRIG_TYPE_SAMP:
         sym = m_bw.addSampler(name,segment,&srcInfo);
         break;
-    case Brig::BRIG_TYPE_FBAR:
-        syntaxError("unexpected type",&srcInfo);
-        break;
     default:
         sym = m_bw.addVariable(name,segment,dType,&srcInfo);
     }
 
-    if (declPfx.align.isInitialized())
-        sym.align() = declPfx.align;
+    sym.align() = declPfx.align.isInitialized() ? declPfx.align : (unsigned) getNaturalAlignment(dType);
 
     if (declPfx.hasConst.isInitialized())
         sym.modifier().isConst() = declPfx.hasConst;
@@ -1330,14 +1496,14 @@ DirectiveSymbol Parser::parseDecl(bool isArg, bool isLocal,const DeclPrefix& dec
         if (sym.modifier().isArray() && sym.dim() == 0) {
             if (DirectiveVariableInit init = sym.init())
                 sym.dim() = init.elementCount();
-            else if (DirectiveLabelList init = sym.init())
+            else if (DirectiveLabelInit init = sym.init())
                 sym.dim() = init.elementCount();
             else // Image or Sampler
                 sym.dim() = 1;
         }
     }
 
-    sym.modifier().isDeclaration() = (isArg || sym.modifier().linkage() == Brig::BRIG_LINKAGE_EXTERN); //dp
+    sym.modifier().isDeclaration() = (isArg || sym.modifier().linkage() == Brig::BRIG_LINKAGE_EXTERN);
 
     return sym;
 }
@@ -1429,10 +1595,15 @@ Inst Parser::parseInst()
 {
     PDBG;
     Inst res;
+    m_scanner.setContext(Brig::BRIG_INST_NONE);
     switch(token()) {
     case EInstruction: {
             SourceInfo const srcInfo = tokenSourceInfo();
             res = parseMnemo(m_scanner, m_bw);
+
+            const char* errMsg = preValidateInst(res, m_bw.getMachineModel());
+            if (errMsg) syntaxError(errMsg);
+
             res.annotate(srcInfo);
             {
                 scan();
@@ -1444,12 +1615,6 @@ Inst Parser::parseInst()
                 eatToken(ESemi);
             }
 
-            //dp start
-            //dp if (InstBr i = res) {
-            //dp     // getDefWidth may be called only after parsing branch/call args
-            //dp     if (i.width() == Brig::BRIG_WIDTH_NONE) i.width() = getDefWidth(i);
-            //dp }
-            //dp end
         } break;
     case EInstruction_Vx: {
             Brig::BrigOpcode16_t const opCode = m_scanner.brigId();
@@ -1500,6 +1665,10 @@ Inst Parser::parseInstLdSt()
     SourceInfo const srcInfo = tokenSourceInfo();
     int vector=1;
     Inst inst = parseMnemoMem(m_scanner,m_bw,&vector);
+
+    const char* errMsg = preValidateInst(inst, m_bw.getMachineModel());
+    if (errMsg) syntaxError(errMsg);
+
     inst.annotate(srcInfo);
 
     scan();
@@ -1519,6 +1688,10 @@ Inst Parser::parseInstCombineExpand(unsigned operandIdx)
     SourceInfo const srcInfo = tokenSourceInfo();
     int vector=1;
     Inst inst = parseMnemoSourceType(m_scanner,m_bw,&vector);
+
+    const char* errMsg = preValidateInst(inst, m_bw.getMachineModel());
+    if (errMsg) syntaxError(errMsg);
+
     inst.annotate(srcInfo);
 
     scan();
@@ -1607,7 +1780,7 @@ Operand Parser::parseActualParamList()
         SourceInfo const srcInfo = tokenSourceInfo();
         SRef const argName = m_scanner.readStringValue();
 
-        DirectiveSymbol arg = m_bw.findInScopes<DirectiveSymbol>(argName);
+        DirectiveVariable arg = m_bw.findInScopes<DirectiveVariable>(argName);
 		if (!arg) {
 			syntaxError("Symbol not found", &srcInfo);
 		}
@@ -1720,11 +1893,9 @@ void Parser::parseNoOperands(Inst )
 {
 }
 
-
 void Parser::parseOperandGeneric(Inst inst, unsigned opndIdx)
 {
-    unsigned const reqType = getImmOperandType(inst, opndIdx, m_bw.getMachineType());
-    //dp inst.operand(opndIdx) = parseOperandGeneric(reqType);
+    unsigned const reqType = getOperandType(inst, opndIdx, m_bw.getMachineModel());
     m_bw.setOperand(inst,opndIdx,parseOperandGeneric(reqType));
 }
 
@@ -1763,7 +1934,7 @@ Operand Parser::parseOperandGeneric(unsigned requiredType)
     case EWaveSizeMacro:
         {
             SourceInfo const srcInfo = tokenSourceInfo();
-            res = m_bw.createWaveSz(requiredType,&srcInfo);
+            res = m_bw.createWaveSz(&srcInfo);
         }
         scan();
         break;
@@ -1782,7 +1953,7 @@ Operand Parser::parseOperandGeneric(unsigned requiredType)
         break;
 
     default:
-        syntaxError("unexpected operand");
+        syntaxError("invalid operand");
     }
     return res;
 }
@@ -1813,6 +1984,9 @@ Operand Parser::parseOperandRegVector()
     std::string reg[4];
     unsigned int i = 0;
     do {
+        if (token() != ERegister) {
+          syntaxError("Register expected");
+        }
         reg[i++] =  m_scanner.readStringValue();
     } while ( i < sizeof reg/sizeof reg[0] && tryEatToken(EComma) );
 
@@ -1856,8 +2030,10 @@ public:
     template <typename ReqBrigType> void visit() {
         setImmed(m_operand,readValueIncludingPacked<ReqBrigType,ConvertImmediate>(m_scanner));
     }
-    void visitNone(unsigned) const {
-        m_scanner.syntaxError("unexpected type");
+    void visitNone(unsigned type) const {
+        if      (type==(unsigned) Brig::BRIG_TYPE_INVALID) { m_scanner.syntaxError("malformed instruction");   }
+        else if (type==(unsigned) Brig::BRIG_TYPE_NONE)    { m_scanner.syntaxError("unexpected operand");      }
+        else                                    { m_scanner.syntaxError("unexpected operand type"); }
     }
 };
 
@@ -1871,25 +2047,25 @@ Operand Parser::parseConstantGeneric(unsigned requiredType)
     return operand;
 }
 
-void Parser::parseAddress(SRef& reg, int32_t& offset)
+void Parser::parseAddress(SRef& reg, int64_t& offset)
 {
     if (token()==ERegister) {
         reg = m_scanner.readStringValue();
         if (token()==EPlus || token()==EMinus) {
             ETokens const signTok = token();
             scan();
-            uint32_t value = readInt<Brig::BRIG_TYPE_U32>(m_scanner);
+            uint64_t value = readInt<Brig::BRIG_TYPE_U64>(m_scanner);
             if (signTok==EMinus) {
-                offset = -(int32_t)value;
+                offset = -(int64_t)value;
             } else {
-                offset = (int32_t)value;
+                offset = (int64_t)value;
             }
         } else {
             offset = 0;
         }
     } else if (isIntegerConstant(token())) {
         reg = SRef();
-        offset = readInt<Brig::BRIG_TYPE_S32>(m_scanner);
+        offset = readInt<Brig::BRIG_TYPE_S64>(m_scanner);
     } else {
         syntaxError("Register or offset expected");
     }
@@ -1906,7 +2082,7 @@ Operand Parser::parseObjectOperand()
 
     SRef const objName = m_scanner.readStringValue();
     SRef reg;
-    int32_t offset = 0;
+    int64_t offset = 0;
     if (tryEatToken(ELAngle)) {
         parseAddress(reg, offset);
         eatToken(ERAngle);
@@ -1930,7 +2106,7 @@ Operand Parser::parseOperandInBraces()
     }
 
     SRef      name,reg;
-    int32_t   offset = 0;
+    int64_t   offset = 0;
     if (token()==EIDStatic || token()==EIDLocal) {
         name= m_scanner.readStringValue();
         eatToken(ERBrace);
@@ -1994,40 +2170,21 @@ void Parser::parseLocation()
     assert(token() == EKWLoc);
     SourceInfo const srcInfo = tokenSourceInfo();
     scan();
-    unsigned const sourceFile = readPositiveInt<Brig::BRIG_TYPE_U32>(m_scanner);
     unsigned const sourceLine = readPositiveInt<Brig::BRIG_TYPE_U32>(m_scanner);
-    Optional<unsigned> sourceColumn, options;
+    unsigned sourceColumn = 1;
     if (isIntegerConstant(token())) {
         sourceColumn = readPositiveInt<Brig::BRIG_TYPE_U32>(m_scanner);
-        if (isIntegerConstant(token())) {
-            options = readPositiveInt<Brig::BRIG_TYPE_U32>(m_scanner);
-        }
+    }
+    if (token() == EQuot) {
+      m_srcFileName = parseStringLiteral(m_scanner);
     }
     eatToken(ESemi);
 
     DirectiveLoc loc = m_bw.createCodeRefDir<DirectiveLoc>(&srcInfo);
-    loc.fileid() = sourceFile;
+    // \todo: add to Brigantine high-level API for adding DirectiveLoc
+    loc.filename() = m_srcFileName;
     loc.line() = sourceLine;
-    if (sourceColumn.isInitialized()) {
-        loc.column() = sourceColumn;
-    }
-    if (options.isInitialized()) {
-        if (options!=0) {
-            syntaxError("only 0 is currently supported for options");
-        }
-    }
-}
-
-void Parser::parseFileDecl()
-{
-    PDBG;
-    assert(token() == EKWFile);
-    DirectiveFile file = m_bw.container().append<DirectiveFile>(tokenSourceInfo());
-    file.code() = m_bw.container().insts().end();
-    scan();
-    file.fileid() = readPositiveInt<Brig::BRIG_TYPE_U32>(m_scanner);
-    file.filename() = parseStringLiteral(m_scanner);
-    eatToken(ESemi);
+    loc.column() = sourceColumn;
 }
 
 void Parser::parseControl()
@@ -2048,7 +2205,7 @@ void Parser::parseControl()
         Operand res;
         SourceInfo const srcInfo = tokenSourceInfo();
         if (token() == EWaveSizeMacro) {
-            res = m_bw.createWaveSz(Brig::BRIG_TYPE_U32,&srcInfo);
+            res = m_bw.createWaveSz(&srcInfo);
             scan();
         } else {
             res = m_bw.createImmed(&srcInfo);
@@ -2095,6 +2252,6 @@ void Parser::validateImmType(unsigned expected, unsigned actual)
 */
 
 
-#include "generated/HSAILParserUtilities_gen.hpp"
+#include "HSAILParserUtilities_gen.hpp"
 
 } // end namespace

@@ -65,21 +65,17 @@ class Validator {
     Validator(const Validator&); // non-copyable
     const Validator &operator=(const Validator &); // not assignable
 
-    //-------------------------------------------------------------------------
+    //==========================================================================
     // Public Validator API
 public:
     Validator(BrigContainer &c);
     ~Validator();
 
     enum ValidationMode { VM_BrigNotLinked, VM_BrigLinked };
-    bool validate(ValidationMode) const;
-
+    bool validate(ValidationMode mode, bool disasmOnError = false) const;
+         
     std::string getErrorMsg(istream *is) const;
     int getErrorCode() const;
-
-    //-------------------------------------------------------------------------
-
-    static void validate(Inst inst, int operandIdx, SRef msg, bool cond);
 };
 
 } // namespace HSAIL_ASM

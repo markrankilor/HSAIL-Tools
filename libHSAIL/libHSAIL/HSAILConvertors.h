@@ -43,6 +43,7 @@
 
 #include "HSAILTypeUtilities.h"
 #include "HSAILb128_t.h"
+#include "HSAILFloats.h"
 #include <string>
 #include <limits>
 #include <stdexcept>
@@ -124,7 +125,7 @@ struct LengthOnlyRuleConvert {
         return *reinterpret_cast<const DstType*>(&src);
     }
     DstType getBits(false_type*) const { // when sizeof(DstType) != sizeof(SrcType)
-        throw ConversionError("value bitlength should match bitlength of destination");
+        throw ConversionError("literal size must match size of operand type");
     }
 
     DstType visit(...) const {
@@ -143,7 +144,7 @@ struct TruncateRuleConvert {
         return *reinterpret_cast<const DstType*>(&src);
     }
     DstType getBits(false_type*) const { // when sizeof(DstType) > sizeof(SrcType)
-        throw ConversionError("value bitlength should match or exceed the bitlength of destination");
+        throw ConversionError("literal size must match or exceed size of operand type");
     }
 
     DstType visit(...) const {
@@ -173,8 +174,10 @@ struct LosslessConvert {
 
     // float = int
     DstType visit(BrigTypeF*, BrigTypeNF*) const {
-        DstType res = static_cast<DstType>(src);
-        if (static_cast<SrcType>(res)!=src) {
+        typedef typename IEEE754Traits<DstType>::NativeType NativeType;
+        NativeType s = static_cast<NativeType>(src);
+        DstType res(&s);
+        if ((SrcType)(res.floatValue()) != src) {
             throw ConversionError("conversion loses precision, use float literal");
         }
         return res;
@@ -232,11 +235,16 @@ struct ConvertImmediate {
     template <template <typename,typename> class Convertor>
     DstType use() const { return convert<DstBrigType,SrcBrigType,Convertor>(src); }
 
+    // \todo this conversion is never selected if non-template conversions are available
+    template <typename T>
+    DstType visit(T*, T*) { return src; }
+
     // bitstring = anything
     DstType visit(BrigTypeB*, ...) const { return use<LengthOnlyRuleConvert>(); }
 
     // int or float = int
     DstType visit(BrigTypeNonPacked*, BrigTypeNF*) const { return use<LosslessConvert>(); }
+    DstType visit(BrigTypeNF*, BrigTypeNF*) const { return use<LosslessConvert>(); }
 
     // special overload to resolve overload conflict with assign(BrigTypeB*, ...)
     DstType visit(BrigTypeB*, BrigTypeNF*) const { return use<LosslessConvert>(); }
@@ -244,8 +252,17 @@ struct ConvertImmediate {
     // b1 = int
     DstType visit(BrigType<Brig::BRIG_TYPE_B1>*, BrigTypeNF*) const { return src!=0; }
 
+
     // float = float
-    DstType visit(BrigTypeF*, BrigTypeF*) const { return use<StaticCastConvert>(); }
+    DstType visit(BrigType<Brig::BRIG_TYPE_F32>*, BrigType<Brig::BRIG_TYPE_F32>*) const { return src; }
+    DstType visit(BrigType<Brig::BRIG_TYPE_F64>*, BrigType<Brig::BRIG_TYPE_F64>*) const { return src; }
+    DstType visit(BrigType<Brig::BRIG_TYPE_F16>*, BrigType<Brig::BRIG_TYPE_F16>*) const { return src; }
+    DstType visit(BrigTypeF*, BrigTypeF*) const {
+        // \todo this needs special handling of QNAN/SNAN during conversion
+        typedef typename ::HSAIL_ASM::IEEE754Traits<DstType>::NativeType NativeType;
+        NativeType res = static_cast<NativeType>(src.floatValue());
+        return DstType(&res);
+    }
 
     // packed[N] = int
     template <typename DstElemType,size_t N>

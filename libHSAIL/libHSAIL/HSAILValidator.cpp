@@ -1,36 +1,36 @@
 // University of Illinois/NCSA
 // Open Source License
-// 
+//
 // Copyright (c) 2013, Advanced Micro Devices, Inc.
 // All rights reserved.
-// 
+//
 // Developed by:
-// 
+//
 //     HSA Team
-// 
+//
 //     Advanced Micro Devices, Inc
-// 
+//
 //     www.amd.com
-// 
+//
 // Permission is hereby granted, free of charge, to any person obtaining a copy of
 // this software and associated documentation files (the "Software"), to deal with
 // the Software without restriction, including without limitation the rights to
 // use, copy, modify, merge, publish, distribute, sublicense, and/or sell copies
 // of the Software, and to permit persons to whom the Software is furnished to do
 // so, subject to the following conditions:
-// 
+//
 //     * Redistributions of source code must retain the above copyright notice,
 //       this list of conditions and the following disclaimers.
-// 
+//
 //     * Redistributions in binary form must reproduce the above copyright notice,
 //       this list of conditions and the following disclaimers in the
 //       documentation and/or other materials provided with the distribution.
-// 
+//
 //     * Neither the names of the LLVM Team, University of Illinois at
 //       Urbana-Champaign, nor the names of its contributors may be used to
 //       endorse or promote products derived from this Software without specific
 //       prior written permission.
-// 
+//
 // THE SOFTWARE IS PROVIDED "AS IS", WITHOUT WARRANTY OF ANY KIND, EXPRESS OR
 // IMPLIED, INCLUDING BUT NOT LIMITED TO THE WARRANTIES OF MERCHANTABILITY, FITNESS
 // FOR A PARTICULAR PURPOSE AND NONINFRINGEMENT.  IN NO EVENT SHALL THE
@@ -42,6 +42,7 @@
 
 #include "HSAILValidatorBase.h"
 #include "HSAILValidator.h"
+#include "HSAILDisassembler.h"
 #include "HSAILScanner.h" // using SyntaxError utilities
 #include "HSAILItems.h"
 #include "HSAILUtilities.h"
@@ -66,11 +67,11 @@ using std::ostringstream;
 // ============================================================================
 // ============================================================================
 //============================================================================
-// Instruction Validator
 
 namespace HSAIL_ASM {
 
 //============================================================================
+// BRIG Sections
 
 enum {
     BRIG_SEC_DIRECTIVES  = 0,
@@ -80,7 +81,8 @@ enum {
     BRIG_SEC_STRTAB      = 4,
 
     BRIG_NUM_SECTIONS    = 5,
-    BRIG_NUM_BYTES_RESERVED = 4
+    BRIG_NUM_BYTES_RESERVED = 4,
+    BRIG_MIN_STRTAB_ITEM_SIZE = 4
 };
 
 //============================================================================
@@ -89,8 +91,8 @@ enum {
 class BrigFormatError
 {
 public:
-    static const int ERRCODE_STD  = 100;
-    static const int ERRCODE_INST = 101;
+    static const int ERRCODE_STD  = 100; // Generic Validator error code
+    static const int ERRCODE_INST = 101; // Instruction Validator error code
 
 private:
     string msg;
@@ -116,15 +118,35 @@ public:
     void clear()                { msg.clear(); }
 };
 
+void PropValidator::validate(Inst inst, int operandIdx, bool cond, SRef msg)
+{
+    assert(inst);
+
+    if (!cond)
+    {
+        int code = BrigFormatError::ERRCODE_INST;
+        if (0 <= operandIdx && operandIdx <= 4 && inst.operand(operandIdx))
+        {
+            Operand opr = inst.operand(operandIdx);
+            throw BrigFormatError(BRIG_SEC_OPERANDS, opr.brigOffset(), msg, code);
+        }
+        else
+        {
+            throw BrigFormatError(BRIG_SEC_CODE, inst.brigOffset(), msg, code);
+        }
+    }
+}
+
 } // namespace HSAIL_ASM
 
 //============================================================================
 //============================================================================
 //============================================================================
+// Instruction Validator
 
 //F Make it a separate component
 
-#include "generated/HSAILInstValidation_gen.hpp"
+#include "HSAILInstValidation_gen.hpp"
 
 //============================================================================
 //============================================================================
@@ -132,10 +154,97 @@ public:
 
 namespace HSAIL_ASM {
 
+unsigned getOperandType(Inst inst, unsigned operandIdx, unsigned machineModel)
+{
+    using namespace Brig;
+    assert(operandIdx < 5);
+    assert(machineModel == BRIG_MACHINE_SMALL || machineModel == BRIG_MACHINE_LARGE);
+
+    InstValidator prop(machineModel);
+    unsigned attr = prop.getOperandAttr(inst, operandIdx);
+
+    switch(attr)
+    {
+    case OPERAND_ATTR_INVALID:  return BRIG_TYPE_INVALID;
+    case OPERAND_ATTR_NONE:     return BRIG_TYPE_NONE;
+
+    case OPERAND_ATTR_MODEL:    return (machineModel == BRIG_MACHINE_SMALL)? BRIG_TYPE_U32 : BRIG_TYPE_U64;;
+
+    case OPERAND_ATTR_SEG:      
+    case OPERAND_ATTR_TSEG:     return getSegAddrSize(getSegment(inst), machineModel == BRIG_MACHINE_LARGE) == 32? BRIG_TYPE_U32 : BRIG_TYPE_U64;
+
+    default:                    return prop.attr2type(inst, operandIdx, attr);
+    }
+}
+
+// Validate values of instruction fields which affect possible operand types
+static const char* validateOperandDeps(Inst inst, unsigned operandIdx, unsigned machineModel)
+{
+    using namespace Brig;
+    assert(operandIdx < 5);
+    assert(machineModel == BRIG_MACHINE_SMALL || machineModel == BRIG_MACHINE_LARGE);
+
+    InstValidator prop(machineModel);
+    unsigned attr = prop.getOperandAttr(inst, operandIdx);
+
+    switch(attr)
+    {
+    case OPERAND_ATTR_NONE:     return 0; // Cannot report anything as there are optional operands //F Could it be improved?
+    case OPERAND_ATTR_INVALID:  return 0; // Refrain reporting an error as validator will provide better explanation
+
+    case OPERAND_ATTR_P2U:
+    case OPERAND_ATTR_DTYPE:    if (!typeX2str(inst.type()) || inst.type() == BRIG_TYPE_NONE) return "Invalid instruction type";
+                                break;
+
+    case OPERAND_ATTR_STYPE:    if (!typeX2str(getSrcType(inst)))
+                                {
+                                    if (InstSignal(inst)) return "Invalid signal type"; //F make separate attribute
+                                    return "Invalid source type";
+                                }
+                                if (getSrcType(inst) == BRIG_TYPE_NONE) 
+                                {
+                                    if (InstSignal(inst)) return "Missing signal type"; //F make separate attribute
+                                    return "Missing source type";
+                                }
+                                break;
+
+    case OPERAND_ATTR_CTYPE:    if (!typeX2str(getSrcType(inst)))       return "Invalid coord type";
+                                if (getSrcType(inst) == BRIG_TYPE_NONE) return "Missing coord type";
+                                break;
+
+    case OPERAND_ATTR_ITYPE:    if (!typeX2str(getImgType(inst)))       return "Invalid image type";
+                                if (getImgType(inst) == BRIG_TYPE_NONE) return "Missing image type";
+                                break;
+
+    case OPERAND_ATTR_SEG:      
+    case OPERAND_ATTR_TSEG:     if (!segment2str(getSegment(inst)))        return "Invalid segment";
+                                if (getSegment(inst) == BRIG_SEGMENT_NONE) return "Missing segment";
+                                break;
+
+    default:
+        break;
+    }
+
+    return 0;
+}
+
+const char* preValidateInst(Inst inst, unsigned machineModel)
+{
+    for (unsigned idx = 0; idx < 5; ++idx)
+    {
+        const char* err = validateOperandDeps(inst, idx, machineModel);
+        if (err) return err;
+    }
+    return 0;
+}
+
+//============================================================================
+//============================================================================
+//============================================================================
+
 struct BrigHelper
 {
 public: // Brig Object Kind Identification
-
 
     static bool isSbr(Directive d)
     {
@@ -157,9 +266,14 @@ public: // Brig Object Kind Identification
         return DirectiveKernel(d);
     }
 
+    static bool isVar(Directive d)
+    {
+        return DirectiveVariable(d);
+    }
+
     static bool isSym(Directive d)
     {
-        return DirectiveSymbol(d); // variable, image or a sampler
+        return isVar(d) || isFbar(d) || isLTargets(d);
     }
 
     static bool isFbar(Directive d)
@@ -167,30 +281,26 @@ public: // Brig Object Kind Identification
         return DirectiveFbarrier(d);
     }
 
+    static bool isLTargets(Directive d)
+    {
+        return DirectiveLabelTargets(d);
+    }
+
     static bool isLabel(Directive d)
     {
         return DirectiveLabel(d);
     }
 
-    static unsigned getKind(Directive d) //F: merge with similar code using templates
-    {
-        return d.brig()->kind;
-    }
-
 public: // Brig Object Properties
-
-    static unsigned getKind(Operand opr)
-    {
-        return opr.brig()->kind;
-    }
 
     static SRef getName(Directive d)
     {
-        if      (DirectiveExecutable dn = d) return dn.name();
-        else if (DirectiveSymbol     dn = d) return dn.name();
-        else if (DirectiveLabel      dn = d) return dn.name();
-        else if (DirectiveSignature  dn = d) return dn.name();
-        else if (DirectiveFbarrier   dn = d) return dn.name();
+        if      (DirectiveExecutable   dn = d) return dn.name();
+        else if (DirectiveVariable     dn = d) return dn.name();
+        else if (DirectiveLabel        dn = d) return dn.name();
+        else if (DirectiveLabelTargets dn = d) return dn.name();
+        else if (DirectiveSignature    dn = d) return dn.name();
+        else if (DirectiveFbarrier     dn = d) return dn.name();
 
         assert(false);
         return SRef();
@@ -199,77 +309,68 @@ public: // Brig Object Properties
     static char getNamePref(Directive d)
     {
         string name = getName(d);
-        return name[0];
+        return name.empty()? 0 : name[0];
     }
 
     static unsigned getDataType(Directive d)
     {
         assert(d);
-        if      (DirectiveSymbol       sym  = d) return sym.type();
+        if      (DirectiveVariable     sym  = d) return sym.type();
         else if (DirectiveVariableInit init = d) return sym.type();
 
         assert(false);
-        return 0;
-    }
-
-    static unsigned getSegment(Inst inst)
-    {
-        return HSAIL_ASM::getSegment(inst);
-    }
-
-    static unsigned getSegment(Operand opr)
-    {
-        assert(opr);
-
-        if (OperandAddress addr = opr)
-        {
-            if (addr.symbol()) return getSegment(addr.symbol());
-        }
-        assert(false);
-        return (unsigned)-1;
+        return Brig::BRIG_TYPE_NONE;
     }
 
     static unsigned getSegment(Directive d)
     {
-        if (DirectiveSymbol sym = d) return sym.segment();
-        else if (isFbar(d))          return Brig::BRIG_SEGMENT_GROUP;
+        if (DirectiveVariable sym = d) return sym.segment();
+        else if (isFbar(d))            return Brig::BRIG_SEGMENT_GROUP;
+        else if (isLTargets(d))        return Brig::BRIG_SEGMENT_NONE;
 
         assert(false);
-        return (unsigned)-1;
+        return Brig::BRIG_SEGMENT_NONE;
     }
 
-    static bool isArgSeg(Directive d) {
-        assert(isSym(d) || isFbar(d));
+    static bool isArgSeg(Directive d)
+    {
+        assert(isSym(d));
         return getSegment(d) == Brig::BRIG_SEGMENT_ARG;
     }
 
-    static bool isKernArgSeg(Directive d) {
-        assert(isSym(d) || isFbar(d));
+    static bool isKernArgSeg(Directive d)
+    {
+        assert(isSym(d));
         return getSegment(d) == Brig::BRIG_SEGMENT_KERNARG;
     }
 
-    static bool isSpillSeg(Directive d) {
-        assert(isSym(d) || isFbar(d));
+    static bool isSpillSeg(Directive d)
+    {
+        assert(isSym(d));
         return getSegment(d) == Brig::BRIG_SEGMENT_SPILL;
     }
 
-    static bool isGlobalSeg(Directive d) {
-        assert(isSym(d) || isFbar(d));
+    static bool isGlobalSeg(Directive d)
+    {
+        assert(isSym(d));
         return getSegment(d) == Brig::BRIG_SEGMENT_GLOBAL;
     }
 
-    static bool isGroupSeg(Directive d) {
-        assert(isSym(d) || isFbar(d));
+    static bool isGroupSeg(Directive d)
+    {
+        assert(isSym(d));
         return getSegment(d) == Brig::BRIG_SEGMENT_GROUP;
     }
 
-    static bool isPrivateSeg(Directive d) {
-        assert(isSym(d) || isFbar(d));
+    static bool isPrivateSeg(Directive d)
+    {
+        assert(isSym(d));
         return getSegment(d) == Brig::BRIG_SEGMENT_PRIVATE;
     }
 
-    static bool isReadonlySeg(Directive d) {
-        assert(isSym(d) || isFbar(d));
+    static bool isReadonlySeg(Directive d)
+    {
+        assert(isSym(d));
         return getSegment(d) == Brig::BRIG_SEGMENT_READONLY;
     }
 
@@ -278,9 +379,11 @@ public: // Brig Object Properties
         // TBD: Do signatures and fbarriers have static linkage? Assime it for now
         // This is necessary to process signatures and fbarriers just like other symbols
 
-        if      (DirectiveSymbol     ds = d) return ds.modifier().linkage();
+        if      (DirectiveVariable   ds = d) return ds.modifier().linkage();
         else if (DirectiveExecutable ds = d) return ds.modifier().linkage();
-        else if (isProto(d) || isFbar(d))    return Brig::BRIG_LINKAGE_STATIC; // this is to process signatures and fbarriers just like other symbols
+        else if (isProto(d) || isFbar(d)) return Brig::BRIG_LINKAGE_STATIC; // this is to process signatures and fbarriers just like other symbols
+
+        assert(!isLTargets(d));
         return Brig::BRIG_LINKAGE_NONE;
     }
 
@@ -296,10 +399,11 @@ public: // Brig Object Properties
 
     static bool isDecl(Directive d)
     {
-        if      (DirectiveSymbol     ds = d) return ds.modifier().isDeclaration();
-        else if (DirectiveExecutable ds = d) return ds.modifier().isDeclaration();
-        else if (DirectiveSignature  ds = d) return true;
-        else if (DirectiveFbarrier   ds = d) return false;
+        if      (DirectiveVariable     ds = d) return ds.modifier().isDeclaration();
+        else if (DirectiveExecutable   ds = d) return ds.modifier().isDeclaration();
+        else if (DirectiveSignature    ds = d) return true;
+        else if (DirectiveFbarrier     ds = d) return false;
+        else if (DirectiveLabelTargets ds = d) return false;
 
         assert(false);
         return false;
@@ -312,81 +416,51 @@ public: // Brig Object Properties
 
     static uint64_t getArraySize(Directive d)
     {
-        if (DirectiveSymbol sym = d) return sym.dim();
+        if (DirectiveVariable sym = d) return sym.dim();
         assert(false);
         return 0;
     }
 
     static unsigned getAlignment(Directive d)
     {
-        assert(isSym(d));
-        if (DirectiveSymbol sym = d) return sym.align();
+        assert(isVar(d));
+        if (DirectiveVariable sym = d) return sym.align();
         assert(false);
-        return 0;
-    }
-
-    static unsigned getNaturalAlignment(unsigned type)
-    {
-        assert(HSAIL_ASM::typeX2str(type));
-        switch(getTypeSize(type))
-        {
-        case 16:  return 2;
-        case 32:  return 4;
-        case 64:  return 8;
-        case 128: return 16;
-        default:  return 1;
-        }
-    }
-
-    static unsigned getPhysicalAlignment(unsigned type, unsigned align)
-    {
-        assert(align == 0 || align == 1 || align >= getNaturalAlignment(type));
-        return (align == 0)? getNaturalAlignment(type) : align;
-    }
-
-    static unsigned getPhysicalAlignment(Directive d)
-    {
-        assert(isSym(d));
-        return getPhysicalAlignment(getDataType(d), getAlignment(d));
-    }
-
-    bool checkAlign(unsigned align, unsigned type) const
-    {
-        return align == 0 || getNaturalAlignment(type) <= align;
+        return Brig::BRIG_ALIGNMENT_NONE;
     }
 
     static bool isConst(Directive d)
     {
-        if (DirectiveSymbol sym = d) return sym.modifier().isConst();
+        if (DirectiveVariable sym = d) return sym.modifier().isConst();
         assert(false);
         return false;
     }
 
     static bool isArray(Directive d)
     {
-        if (DirectiveSymbol sym = d) return sym.modifier().isArray();
+        if (DirectiveVariable sym = d) return sym.modifier().isArray();
         assert(false);
         return false;
     }
 
     static bool isFlex(Directive d)
     {
-        if (DirectiveSymbol sym = d) return sym.modifier().isFlexArray();
+        if (DirectiveVariable sym = d) return sym.modifier().isFlexArray();
         assert(false);
         return false;
     }
 
     static bool isInitialized(Directive d)
     {
-        if (DirectiveSymbol sym = d) return sym.init();
+        if (DirectiveVariable sym = d) return sym.init();
         return false;
     }
 
     static Directive getInitializer(Directive d)
     {
-        assert(isSym(d));
+        assert(isVar(d));
 
-        if (DirectiveSymbol sym = d) return sym.init();
+        if (DirectiveVariable sym = d) return sym.init();
         return Directive();
     }
 
@@ -449,9 +523,7 @@ public: // Brig Object Properties
     static Directive getNextTopLevel(Directive d)
     {
         if (DirectiveExecutable exec = d) return exec.nextTopLevelDirective();
-
-        assert(false);
-        return d.next();
+        else return d.next();
     }
 
     static Inst getFirstOperation(Directive d)
@@ -461,13 +533,6 @@ public: // Brig Object Properties
         assert(false);
         return Inst();
     }
-
-    static bool isGcnInst(Inst inst)
-    {
-        assert(inst);
-        return HSAIL_ASM::isGcnInst(inst.opcode());
-    }
-
 };
 
 //=============================================================================
@@ -488,10 +553,21 @@ private:
     typedef set<SRef> NameSet;
     typedef map<SRef, Directive> NameMap;
 
-    enum State {
+    enum State
+    {
         STATE_PRG_SCOPE,    // Program (global) scope
         STATE_SBR_SCOPE,    // Subroutine (Kernel/Function) scope
         STATE_ARG_SCOPE     // Argument scope
+    };
+
+    enum Extension
+    {
+        EXTENSIONS_NONE   = 0, // No extensions
+
+        EXTENSION_CORE    = 1, // CORE extension
+        EXTENSION_IMAGE   = 2, // IMAGE extension
+        EXTENSION_GCN     = 4, // GCN extension
+        EXTENSION_UNKNOWN = 8  // Unknown extension
     };
 
 private:
@@ -502,6 +578,9 @@ private: // Context state
     State    state;     // context state: program/sbr/block scope
     bool     isBlock;   // true while processing block directives; false otherwise
     unsigned callsNum;  // number of call instructions in the current code block
+
+private: // Enabled extensions
+    unsigned extensions;     // enabled extensions
 
 private: // File id
     set<unsigned> fileIds; // Registered file ids
@@ -522,7 +601,7 @@ private:
     NameSet     labelNames;     // names of all labels in the current func/kernel
 
     // These two sets are used for validation of 'call' arguments:
-    // - to ensure that input call args are not used as output args abd vice versa
+    // - to ensure that input call args are not used as output args and vice versa
     // - to ensure that input call args are not accessed after the call
 private:
     set<Offset> inputArgs;      // d-offset of input call args
@@ -539,12 +618,15 @@ private: // Local variables (sbr-scoped and blk-scoped)
     NameSet     sbrVarNames;    // names of visible sbr-scoped symbols, includes non-arg variables defined in arg scope
 
 private: // Global (program-scope) identifiers (variables, functions, kernels)
-    set<Offset> prgSymDefs;     // d-offsets of visible symbols
     NameSet     prgSymUsed;     // names of functions used by program (to check that used static fns are defined)
-    NameMap     prgSymDesc;     // pairs [name, directive]
+    NameMap     prgSymDesc;     // pairs [name, directive] - used to validate that symbols are defined/declared before use
+    NameMap     statSymRef;     // pairs [name, directive] - used to identify def/decl of static symbols which should be referred to by operands
+                                //                           (either definition or first declaration if not defined)
 
 private: // Externally-visible identifiers (variables, functions, kernels)
     NameMap     extSymDesc;     // pairs [name, directive]
+    NameMap     extSymRef;      // pairs [name, directive] - used to identify def/decl of extern symbols which should be referred to by operands
+                                //                           (either definition or first declaration if not defined)
 
 private:
     ValidatorContext(const ValidatorContext&); // non-copyable
@@ -562,6 +644,7 @@ public:
     void startProgram()
     {
         assert(isPrgScope());
+        clearExtensions();
     }
 
     void endProgram()
@@ -578,7 +661,8 @@ public:
         state = STATE_SBR_SCOPE;
 
         Directive arg = d.next();
-        for (unsigned argsNum = getParamNum(d); argsNum > 0; --argsNum) {
+        for (unsigned argsNum = getParamNum(d); argsNum > 0; --argsNum)
+        {
             assert(arg);
             defineVar(arg, true, isKernel(d));
             arg = arg.next();
@@ -653,7 +737,7 @@ public:
 
     void defineVar(Directive d, bool isArgument = false, bool isKernelArgument = false)
     {
-        assert(isSym(d) || isFbar(d));
+        assert(isSym(d));
 
         if (isKernArgSeg(d))
         {
@@ -678,7 +762,7 @@ public:
 
     void checkVarUse(Operand opr, Directive d)
     {
-        assert(isSym(d) || isFbar(d));
+        assert(isSym(d));
 
         checkSymUse(opr, d);
 
@@ -690,7 +774,7 @@ public:
 
     bool isTransientArg(Directive d) // True for arg variables defined inside an arg scope
     {
-        assert(isSym(d));
+        assert(isVar(d));
         Offset off = d.brigOffset();
         return isArgSeg(d) && blkVarDefs.count(off) > 0; // NB: blkVarDefs includes ALL variables defined in arg scope (not only arguments)
     }
@@ -760,6 +844,58 @@ public:
     void clearFileIds()
     {
         fileIds.clear();
+    }
+
+public:
+    // Register a definition or declaration of a global symbol.
+    // The purpose is to identify directive which should be used for all references
+    // to this symbol - the first definition (or first declaration if there are no definitions).
+    void registerGlobalSym(Directive d)
+    {
+        assert(isVar(d) || isFbar(d) || isSbr(d) || isProto(d));
+
+        NameMap &desc = (isStatic(d)? statSymRef : extSymRef);
+
+        if (desc.count(getName(d)) == 0 || isDef(d))  // This is the first definition/declaration
+        {
+            desc[getName(d)] = d;
+        }
+    }
+
+    // Check if the specified directive is the one which must be used for
+    // all references to the corresponding symbol
+    bool isValidGlobalReference(Directive d)
+    {
+        assert(isVar(d) || isFbar(d) || isSbr(d) || isProto(d));
+
+        NameMap &desc = isStatic(d)? statSymRef : extSymRef;
+        return desc.count(getName(d)) > 0 && desc[getName(d)] == d;
+    }
+
+public: // Extensions
+    void registerExtension(DirectiveExtension ext)
+    {
+        if (ext.name() == "CORE")
+        {
+            validate(ext, extensions == EXTENSIONS_NONE || extensions == EXTENSION_CORE, "'CORE' extension is incompatible with any other extension");
+            extensions = EXTENSION_CORE;
+        }
+        else
+        {
+            validate(ext, extensions == EXTENSIONS_NONE || extensions != EXTENSION_CORE, "No extensions are compatible with 'CORE' extension");
+
+            if      (ext.name() == "amd:gcn") extensions |= EXTENSION_GCN;
+            else if (ext.name() == "IMAGE")   extensions |= EXTENSION_IMAGE;
+            else                              extensions |= EXTENSION_UNKNOWN;
+        }
+    }
+
+    void clearExtensions() { extensions = EXTENSIONS_NONE; }
+
+    void validateExtensionOpcode(Inst inst)
+    {
+        if      (isGcnInst(inst.opcode()))   validate(inst, (extensions & EXTENSION_GCN) != 0,   "GCN extension is not enabled");
+        else if (isImageInst(inst.opcode())) validate(inst, (extensions & EXTENSION_IMAGE) != 0, "IMAGE extension is not enabled");
     }
 
 private:
@@ -842,9 +978,11 @@ private:
     // Implementation: VARIABLES, FUNCTIONS, KERNELS
     //-------------------------------------------------------------------------
 
+    // Local symbols cannot be declared, only defined.
+    // Consequently, we only check that the symbol is defined only once.
     void addLocalSym(Directive d, bool isArgument)
     {
-        assert(isSym(d) || isFbar(d));
+        assert(isSym(d));
 
         validate(d, isSbrScope() || isArgScope(),
                  "Variables starting with '%' must be defined in kernels or functions");
@@ -867,16 +1005,18 @@ private:
         }
     }
 
+    // Global symbols can be both declared and defined.
+    // Consequently, we check that:
+    // - the symbol is defined only once;
+    // - if there are several declarations (and possibly a definition), they are identical.
     void addGlobalSym(Directive d)
     {
-        assert(isSym(d) || isFbar(d) || isSbr(d) || isProto(d));
+        assert(isVar(d) || isFbar(d) || isSbr(d) || isProto(d));
 
         validate(d, isPrgScope(),
                  "Identifiers starting with '&' must be defined outside of kernels and functions");
 
         validateDecl(d, prgSymDesc);
-
-        prgSymDefs.insert(d.brigOffset());
 
         // Special handling for identifiers visible in other compilation units
         if (!isStatic(d)) // Might be a kernel
@@ -887,18 +1027,17 @@ private:
 
     void validateDecl(Directive d, NameMap &desc)
     {
-        assert(isSym(d) || isFbar(d) || isSbr(d) || isProto(d));
+        assert(isVar(d) || isFbar(d) || isSbr(d) || isProto(d));
 
-        if (desc.count(getName(d)) == 0)
+        if (desc.count(getName(d)) == 0)    // This is the first definition/declaration
         {
-            // This is the first definition/declaration
             desc[getName(d)] = d;
         }
-        else // This must be a redefinition of the same entity
+        else                                // This must be a redefinition of the same entity
         {
             Directive prev = desc[getName(d)];
 
-            validate(d, getKind(d) == getKind(prev),
+            validate(d, d.kind() == prev.kind(),
                      "Invalid identifier redefinition");
 
             // There may be only one definition
@@ -911,60 +1050,60 @@ private:
 
             if (isDef(d))
             {
-                desc[getName(d)] = d; // Replace declaration with definition
+                desc[getName(d)] = d;       // Replace declaration with definition
             }
         }
     }
 
     void checkSymUse(Operand opr, Directive d)
     {
-        assert(isSym(d) || isFbar(d) || isFunc(d) || isProto(d));
+        assert(isSym(d) || isFunc(d) || isProto(d));
 
         Offset off = d.brigOffset();
 
-//std::cerr << "Offset = " << off << "\n";
-
-        if (isLinkedCode && getNamePref(d) == '&' && prgSymDefs.count(off) == 0 && !isProto(d) && !isFbar(d))
+        if (getNamePref(d) == '&') // There are special rules for references to global identifiers
         {
-            // This is a special case because linked code may refer another program.
-            // In this case validate the following conditions:
-            // 1. This is a definition of a symbol;
-            // 2. There is a declaration of a symbol with the same name visible in the current scope;
-            // 3. Definition and declaration are compatible
+            // Make sure that there is a declaration or definition of this symbol visible in the current scope
+            validate(opr, prgSymDesc.count(getName(d)) > 0, "Identifier is not defined/declared or is not visible in the current scope");
 
-            validate(opr, isDef(d), "Invalid linked reference to declaration");
-            validate(opr, prgSymDesc.count(getName(d)) > 0 && isDecl(prgSymDesc[getName(d)]), "Linked reference to symbol without declaration");
-            validate(opr, eqDecl(d, prgSymDesc[getName(d)]), "Linked symbol definition is incompatible with declaration");
-            return;
+            // Make sure that reference goes to definition (or first declaration if there is no definition)
+            validate(opr, isValidGlobalReference(d), "Invalid reference to identifier; must refer definition (or first declaration if not defined)");
         }
-
-        validate(opr, blkVarDefs.count(off) > 0 ||
-                      sbrVarDefs.count(off) > 0 ||
-                      prgSymDefs.count(off) > 0,
-                      "Identifier is not defined/declared or is not visible in the current scope");
-
-
-        // If there are 2 symbols with the same name, one defined outside of an arg block,
-        // and another inside the block, the latter hides the former and the latter
-        // should be used for all references to that name in the arg block.
-        // Improvement should look like this:
-        if (isArgScope() && blkVarNames.count(getName(d)) > 0)
+        else // Local identifiers are simpler to check as they have one definition and no declarations
         {
-            validate(opr, blkVarDefs.count(off) > 0, "Invalid reference to symbol hidden in arg scope by an argument");
+            // Make sure that there is a definition of this symbol visible in the current scope
+            validate(opr, blkVarDefs.count(off) > 0 ||
+                          sbrVarDefs.count(off) > 0,
+                          "Identifier is not defined/declared or is not visible in the current scope");
+
+            // If there are 2 symbols with the same name, one defined outside of an arg block,
+            // and another inside the block, the latter hides the former and the latter
+            // should be used for all references to that name in the arg block.
+            if (isArgScope() && blkVarNames.count(getName(d)) > 0)
+            {
+                validate(opr, blkVarDefs.count(off) > 0, "Invalid reference to symbol hidden in arg scope by an argument");
+            }
         }
     }
 
     bool eqDecl(Directive d1, Directive d2)
     {
-        assert(getKind(d1) == getKind(d2));
+        assert(d1.kind() == d2.kind());
 
-        if (isSym(d1)) {
+        if (isVar(d1))
+        {
             return eqSymDecl(d1, d2);
-        } else if (isSbr(d1)) {
+        }
+        else if (isSbr(d1))
+        {
             return eqSbrDecl(d1, d2);
-        } else if (isProto(d1)) {
+        }
+        else if (isProto(d1))
+        {
             return eqProto(d1, d2);
-        } else {
+        }
+        else
+        {
             assert(false);
             return false;
         }
@@ -996,20 +1135,15 @@ private:
         return false;
     }
 
-    bool eqAlignment(Directive arg1, Directive arg2) const
-    {
-        return (getPhysicalAlignment(arg1) == getPhysicalAlignment(arg2));
-    }
-
     bool eqSymDecl(Directive arg1, Directive arg2) const
     {
         // Check only 'static' attribute ('extern' and 'none' are compatible)
         if (isStatic(arg1) != isStatic(arg2)) return false;
 
-        if (getKind(arg1)     != getKind(arg2)     ||
-            getSegment(arg1)  != getSegment(arg2)  ||
-            getDataType(arg1) != getDataType(arg2) ||
-            !eqAlignment(arg1, arg2)) return false;
+        if (arg1.kind()        != arg2.kind()       ||
+            getSegment(arg1)   != getSegment(arg2)  ||
+            getDataType(arg1)  != getDataType(arg2) ||
+            getAlignment(arg1) != getAlignment(arg2)) return false;
 
         if (isFlex(arg1) != isFlex(arg2)) return false;
 
@@ -1047,8 +1181,7 @@ private:
             if (p1.args(i).type() != p2.args(i).type()) return false;
             if (p1.args(i).modifier().allBits() != p2.args(i).modifier().allBits()) return false;
             if (p1.args(i).modifier().isArray() && p1.args(i).dim() != p2.args(i).dim()) return false;
-            if (getPhysicalAlignment(p1.args(i).type(), p1.args(i).align()) !=
-                getPhysicalAlignment(p2.args(i).type(), p2.args(i).align())) return false;
+            if (p1.args(i).align() != p2.args(i).align()) return false;
         }
 
         return true;
@@ -1086,7 +1219,6 @@ private:
     {
         if (isArgScope())      blkVarDefs.clear();
         else if (isSbrScope()) sbrVarDefs.clear();
-        else                   prgSymDefs.clear();
     }
 
     void clearSymNames()
@@ -1097,6 +1229,7 @@ private:
         {
             prgSymDesc.clear();
             prgSymUsed.clear();
+            statSymRef.clear();
         }
     }
 
@@ -1118,8 +1251,13 @@ private:
 };
 
 //=============================================================================
+// Kernel/function scoped directives are stored separately from instructions
+// but they cannot be validated independently. This helper class is intended
+// to simplify validation by providing a properly ordered list of directives
+// and instructions.
 
-class DirectivesRange {
+class DirectivesRange
+{
 private:
     Inst currentInst;
     unsigned remainingInst;
@@ -1164,6 +1302,11 @@ public:
         return res;
     }
 
+    bool isLastInst()
+    {
+        return remainingInst == 0;
+    }
+
     bool isTrailingDirective() // True if code block ends with a directive
     {
         return remainingInst == 0;
@@ -1186,6 +1329,9 @@ private:
 };
 
 //=============================================================================
+//=============================================================================
+//=============================================================================
+// Validator implementation
 
 static const char* ALPHA    = "_ABCDEFGHIJKLMNOPQRSTUVWXYZabcdefghijklmnopqrstuvwxyz";
 static const char* ALPHANUM = "_ABCDEFGHIJKLMNOPQRSTUVWXYZabcdefghijklmnopqrstuvwxyz0123456789";
@@ -1203,6 +1349,7 @@ private:
     unsigned minor;
 
     mutable BrigFormatError err;
+    bool disasmOnError;
 
     static const int AVR_ITEM_SIZE = 32; //F: customize for each section
 
@@ -1210,21 +1357,24 @@ public:
     //-------------------------------------------------------------------------
     // Public API Implementation
 
-    ValidatorImpl(BrigContainer &c) : brig(c), machineModel(Brig::BRIG_MACHINE_LARGE) {}
+    ValidatorImpl(BrigContainer &c) : brig(c), machineModel(Brig::BRIG_MACHINE_LARGE), disasmOnError(false) {}
 
-    bool validate(const Validator::ValidationMode vMode)
+    bool validate(const Validator::ValidationMode vMode, bool disasm)
     {
+        disasmOnError = disasm;
+
         try
         {
             // Low-level validation
-            validateBrigFormat();
-            validateBrigFields();
+            validateBrigFormat();           // Validation of sections structure
+            validateBrigFields();           // Validation of item field values
 
-            // High-level validation
+            // Version validation
             initBrigVersion();
 
-            validateBrigItems();
-            validateBrigDefs(vMode);
+            // High-level validation
+            validateBrigItems();            // Validation of dependencies between item fields
+            validateBrigDefs(vMode);        // Validation of def/use and context
         }
         catch (BrigFormatError &e)
         {
@@ -1247,7 +1397,7 @@ public:
         {
             ostringstream s;
             SrcLoc const srcLoc = { si->line, si->column };
-            printError(s,*is,srcLoc,err.what());
+            printError(s, *is, srcLoc, err.what());
             return s.str();
         }
         else
@@ -1277,25 +1427,20 @@ private:
 
     void validateBrigFields() const
     {
-        for(Directive d = brig.directives().begin();
-            d != brig.directives().end();
-            d = d.next())
+        for(Directive d = brig.directives().begin(); d != brig.directives().end(); d = d.next())
         {
-            ValidateDirectiveFields(d);
+            validate(d, ValidateBrigDirectiveFields(d) || ValidateBrigBlockFields(d), "Invalid directive kind");
         }
 
-        for(Inst i = brig.insts().begin();
-            i != brig.insts().end();
-            i = i.next())
+        for(Inst i = brig.insts().begin(); i != brig.insts().end(); i = i.next())
         {
-            ValidateInstFields(i);
+            for (int idx = 0; idx < 5; ++idx) validate_BrigOperandOffset(i, i.brig()->operands[idx], "Inst", "operands[*]");
+            validate(i, ValidateBrigInstFields(i), "Invalid instruction kind");
         }
 
-        for(Operand o = brig.operands().begin();
-            o != brig.operands().end();
-            o = o.next())
+        for(Operand o = brig.operands().begin(); o != brig.operands().end(); o = o.next())
         {
-            ValidateOperandFields(o);
+            validate(o, ValidateBrigOperandFields(o), "Invalid operand kind");
         }
     }
 
@@ -1306,6 +1451,7 @@ private:
     {
         Directive d = brig.directives().begin();
         DirectiveVersion v = d;
+
         validate(d, v, "Program must start with Version directive");
 
         major        = v.hsailMajor();
@@ -1324,9 +1470,9 @@ private:
         // TBD: Spec is contradictory about minor hsail versions, but I believe the following check is sane.
         validate(v, v.hsailMinor() <= Brig::BRIG_VERSION_HSAIL_MINOR, "Unsupported minor HSAIL version");
 
-        validate(v, major == v.hsailMajor(), "Version statements have incompatible major numbers");
+        validate(v, major        == v.hsailMajor(),   "Version statements have incompatible major numbers");
         validate(v, machineModel == v.machineModel(), "Version statements have incompatible machine models");
-        validate(v, profile == v.profile(), "Version statements have incompatible profiles");
+        validate(v, profile      == v.profile(),      "Version statements have incompatible profiles");
     }
 
     //-------------------------------------------------------------------------
@@ -1334,7 +1480,7 @@ private:
 
     void validateBrigItems()
     {
-        InstValidator instValidator(getMachineType());
+        InstValidator instValidator(machineModel);
 
         validateDirectivesOrder();
 
@@ -1366,29 +1512,22 @@ private:
     // NB: the code below should register all def/uses of HSAIL symbols
     //     in accordance with ValidatorContext requirements
 
-    void validateExtension(DirectiveExtension ext, DirectiveExtension lastExt) const
-    {
-        if (ext.name() == "CORE")
-        {
-            validate(ext, !lastExt || ext.name() == lastExt.name(), "'CORE' extension is incompatible with any other extension");
-        }
-        else
-        {
-            validate(ext, !lastExt || lastExt.name() != "CORE", "No extensions are compatible with 'CORE' extension");
-        }
-    }
-
     void validateBrigDefs(const Validator::ValidationMode vMode) const
     {
         ValidatorContext context(brig, vMode == Validator::VM_BrigLinked);
 
-        bool defStart = false;
-        DirectiveExtension lastExt;
+        // Find all definitions and declarations of extern symbols
+        // (functions, variables, images, samplers);
+        // for each identifier, find decl/def directive which must be used
+        // for all references to this identifier (according with spec requirements)
+        analyzeExternSymbols(context);
+
+        bool prgStart = true;
         Directive end = brig.directives().end();
         for (Directive d = brig.directives().begin(); d != end; )
         {
             Directive next = d.next();
-            defStart |= isSym(d) | isSbr(d) | isProto(d) | isFbar(d);
+            prgStart = prgStart && (DirectiveExtension(d) || DirectiveComment(d) || DirectiveLoc(d));
 
             validate(d, isTopLevelStatement(d), "Directive is not allowed at top level");
 
@@ -1407,16 +1546,18 @@ private:
                     validateBrigVersion(dv);
                 }
                 context.startProgram();
-                lastExt = DirectiveExtension();
-                defStart = false;
+                prgStart = true;
 
-                //F enable GCN instructions iif 'gcn' extension is specified
+                // Find all definitions and declarations of static identifiers
+                // (functions, variables, images, samplers, fbarriers);
+                // for each identifier, find decl/def directive which must be used
+                // for all references to this identifier (according with spec requirements)
+                analyzeStaticSymbols(d.next(), context);
             }
             else if (DirectiveExtension ext = d)
             {
-                validate(ext, !defStart, "Extension directive(s) must appear after version directive but before first definition or declaration");
-                validateExtension(ext, lastExt);
-                lastExt = ext;
+                validate(ext, prgStart, "Extension directive(s) must appear after version directive but before other directives");
+                context.registerExtension(ext);
             }
             else
             {
@@ -1440,9 +1581,11 @@ private:
 
         while (!range.empty())
         {
+            bool sbrStart = true;
             while (Directive scoped = range.getNextDirective())
             {
                 if (DirectiveLabel(scoped)) unreachableCode = false;
+                sbrStart = sbrStart && (DirectiveControl(scoped) || DirectiveComment(scoped) || DirectiveLoc(scoped));
 
                 validateBlockSections(scoped, context);
 
@@ -1458,22 +1601,36 @@ private:
                 }
                 else
                 {
-                    if (DirectiveLabel(scoped)) validate(scoped, !range.isTrailingDirective(), "Trailing labels are not allowed");
                     validateDef(scoped, context);
                 }
+                validate(scoped, !range.isTrailingDirective(), "Invalid directive code offset; must refer an instruction in the same code block");
+                if (DirectiveControl(scoped)) validate(scoped, sbrStart, "Control directive(s) must appear before other directives in code block");
             }
             while (Inst i = range.getNextInst())
             {
-                //F: checks for unreachable code are incomplete.
-                //F: check that labels are really used as jump targets
-                validate(i, !unreachableCode, "Unreachable code");
+                context.validateExtensionOpcode(i);
 
+                if (range.isLastInst())
+                {
+                    validate(i, i.opcode() == Brig::BRIG_OPCODE_CODEBLOCKEND, "Each kernel/function must end with instruction codeblockend");
+                }
+                else
+                {
+                    validate(i, i.opcode() != Brig::BRIG_OPCODE_CODEBLOCKEND, "Instruction codeblockend is allowed only at the end of kernel/function");
+
+                    //F: checks for unreachable code are incomplete.
+                    //F: check that labels are really used as jump targets
+                    validate(i, !unreachableCode, "Unreachable code");
+                }
+
+                // Check that all symbols referred to by operands are visible in the current context
                 for (unsigned idx = 0; idx < 5; ++idx)
                 {
                     Operand opr = i.operand(idx);
                     if (opr) validateUse(opr, context);
                 }
 
+                // Validate additional context-sensitive requirements
                 // NB: ORDER IS IMPORTANT!
                 // NB: validate instructions after arguments (important for calls)
                 validateSpecInst(i, context);
@@ -1485,13 +1642,38 @@ private:
         context.endSbr();
     }
 
+    // Analyze extern definitions and register first def/decl
+    void analyzeExternSymbols(ValidatorContext &context) const
+    {
+        Directive end = brig.directives().end();
+        for (Directive d = brig.directives().begin(); d != end; d = analyzeGlobalSym(d, context, false));
+    }
+
+    // Analyze static definitions and register first def/decl
+    void analyzeStaticSymbols(Directive d, ValidatorContext &context) const
+    {
+        Directive end = brig.directives().end();
+        for (; d != end && !DirectiveVersion(d); d = analyzeGlobalSym(d, context, true));
+    }
+
+    // Analyze global definition and register first def/decl
+    Directive analyzeGlobalSym(Directive d, ValidatorContext &context, bool staticOnly) const
+    {
+        if (isVar(d) || isFbar(d) || isSbr(d) || isProto(d))
+        {
+            if (staticOnly == isStatic(d)) context.registerGlobalSym(d);
+            return getNextTopLevel(d);
+        }
+        return d.next();
+    }
+
     void validateDef(Directive d, ValidatorContext &context) const
     {
         if (isLabel(d))
         {
             context.defineLabel(d);
         }
-        else if (isSym(d) || DirectiveFbarrier(d))
+        else if (isVar(d) || DirectiveFbarrier(d))
         {
             context.defineVar(d);
         }
@@ -1499,50 +1681,69 @@ private:
         {
             context.defineProto(d);
         }
-        else if (DirectiveFile(d))
+        // This check is only necessary for unused label lists.
+        // If there are operands which refer this list of labels, they take care of these checks.
+        else if (DirectiveLabelTargets list = d)
         {
-            validate(d, context.registerFileId(DirectiveFile(d).fileid()), "File id must be unique");
-        }
-        else if (DirectiveLoc(d))
-        {
-            validate(d, context.checkFileId(DirectiveLoc(d).fileid()), "DirectiveLoc refers undefined file id");
-        }
-        else if (DirectiveLabelList(d))
-        {
-            /*
-            DirectiveLabelList list = d;
+            context.defineVar(d);
 
             for (unsigned i = 0; i < list.elementCount(); ++i)
             {
-                DirectiveLabel lab = list.labels(i);
-                context.checkLabelUse(lab);
+                context.checkLabelUse(list.labels(i));
             }
-            */
+        }
+        // This check is only necessary for unused label lists.
+        // If there are operands which refer this list of labels, they take care of these checks.
+        else if (DirectiveLabelInit list = d)
+        {
+            // NB: Detailed checks of jump targets are performed by InstructionValidator.
+            // NB: This check is only def/use validation (all referred labels must be visible in the current scope).
+            for (unsigned i = 0; i < list.elementCount(); ++i)
+            {
+                context.checkLabelUse(list.labels(i));
+            }
         }
     }
 
     void validateUse(Operand opr, ValidatorContext &context) const
     {
-        switch (getKind(opr))
+        switch (opr.kind())
         {
         case Brig::BRIG_OPERAND_LABEL_REF:
+            context.checkLabelUse(OperandLabelRef(opr).ref());
+            break;
+
+        case Brig::BRIG_OPERAND_LABEL_TARGETS_REF:
             {
-                Directive d = OperandLabelRef(opr).ref();
-                if (DirectiveLabel lab = d)
+                DirectiveLabelTargets targets = OperandLabelTargetsRef(opr).ref();
+                assert(targets);
+
+                context.checkVarUse(opr, targets);
+
+                unsigned len = targets.elementCount();
+                for (unsigned i = 0; i < len; ++i)
                 {
-                    context.checkLabelUse(lab);
+                    context.checkLabelUse(targets.labels(i));
                 }
-                else if (DirectiveLabelTargets targets = d)
+            }
+            break;
+
+        case Brig::BRIG_OPERAND_LABEL_VARIABLE_REF:
+            {
+                DirectiveVariable var = OperandLabelVariableRef(opr).ref();
+                assert(var);
+
+                context.checkVarUse(opr, var);
+
+                DirectiveLabelInit list = var.init();
+                assert(list);
+
+                // NB: Detailed checks of jump targets are performed by InstructionValidator.
+                // NB: This check is only def/use validation (all referred labels must be visible in the current scope).
+                unsigned len = list.elementCount();
+                for (unsigned i = 0; i < len; ++i)
                 {
-                    unsigned len = targets.elementCount();
-                    for (unsigned i = 0; i < len; ++i)
-                    {
-                        context.checkLabelUse(targets.labels(i));
-                    }
-                }
-                else
-                {
-                    assert(false);
+                    context.checkLabelUse(list.labels(i));
                 }
             }
             break;
@@ -1552,11 +1753,6 @@ private:
             {
                 context.checkVarUse(opr, OperandAddress(opr).symbol());
             }
-            break;
-
-        case Brig::BRIG_OPERAND_ARGUMENT_REF:
-            //context.checkVarUse(opr, OperandArgumentRef(opr).arg());
-            assert(false);
             break;
 
         case Brig::BRIG_OPERAND_FUNCTION_REF:
@@ -1610,7 +1806,7 @@ private:
             {
                 context.checkSbrUse(list, d);
             }
-            else if (isSym(d))
+            else if (isVar(d))
             {
                 context.checkVarUse(list, d);
             }
@@ -1626,13 +1822,11 @@ private:
         for (unsigned n = 0; n < arglist.elementCount(); ++n)
         {
             Directive ref = arglist.elements(n);
-            context.checkVarUse(arglist, ref); //F Remove this check? Looks like it is already validated at validateListUse
             context.registerArg(inst, ref, isOutArgs);
         }
     }
 
-    // NB: THIS FUNCTION MUST CHECK ALL INSTRUCTIONS WHICH MIGHT REFER SYMBOLS, AND REGISTER THEIR USE.
-    // SYMBOLS INCLUDE: FUNCTIONS, SIGNATURES, LABELS, VARIABLES, FBARRIERS
+    // This function is called to check context-specific requirements which 'validateUse' cannot handle.
     void validateSpecInst(Inst i, ValidatorContext &context) const
     {
         if (i.opcode() == Brig::BRIG_OPCODE_CALL)
@@ -1652,27 +1846,21 @@ private:
             }
 
             context.endCall(i);
-            //F
-            // add validation of optional last argument of call
-            // - functions and signatures must be visible
+        }
+        if (i.opcode() == Brig::BRIG_OPCODE_ALLOCA)
+        {
+            validate(i, !context.isArgScope(), "Instruction alloca cannot be used in an argument scope");
         }
         else if (i.opcode() == Brig::BRIG_OPCODE_LDA)
         {
             // lda cannot be used to take the address of an arg variable allocated in the current scope
-            Operand opr = i.operand(1);
-            assert(opr);
-
             SRef msg = "Cannot take address of an arg variable which is not a formal parameter";
-            if (OperandAddress addr = opr)
-            {
-                DirectiveSymbol sym = addr.symbol();
-                validate(opr, !sym || !context.isTransientArg(sym), msg);
-            }
-            else
-            {
-                //F is this checked after instruction validation?
-                assert(false);
-            }
+
+            OperandAddress addr = i.operand(1);
+            assert(addr); // This has been already checked by InstructionValidator
+
+            DirectiveVariable sym = addr.symbol();
+            validate(addr, !sym || !context.isTransientArg(sym), msg);
         }
         else if (i.opcode() == Brig::BRIG_OPCODE_LDC)
         {
@@ -1682,42 +1870,13 @@ private:
                 context.markFuncUsed(funcRef.fn());
             }
         }
-        else if (i.opcode() == Brig::BRIG_OPCODE_BRN || i.opcode() == Brig::BRIG_OPCODE_CBR)
-        {
-            validateJumpTargets(i, context);
-        }
-    }
-
-    void validateJumpTargets(Inst i, ValidatorContext &context) const
-    {
-        unsigned oprIdx = (i.opcode() == Brig::BRIG_OPCODE_BRN)? 1 : 2;
-        Operand opr = i.operand(oprIdx);
-
-        if (OperandAddress addr = opr)
-        {
-            DirectiveVariable sym = addr.symbol();
-            assert(sym);
-
-            if (DirectiveLabelList list = sym.init())
-            {
-                unsigned len = list.elementCount();
-                for (unsigned i = 0; i < len; ++i)
-                {
-                    context.checkLabelUse(list.labels(i));
-                }
-            }
-        }
-        else
-        {
-            //F
-        }
     }
 
     void validateBlockSections(Directive d, ValidatorContext &context) const
     {
         bool isBlockSection = context.isBlockSection();
 
-        switch (getKind(d))
+        switch (d.kind())
         {
         case Brig::BRIG_DIRECTIVE_BLOCK_START:
             validate(d, !isBlockSection, "Nested block sections are not allowed");
@@ -1743,92 +1902,111 @@ private:
     //-------------------------------------------------------------------------
     // Low-level Brig format validation
 
-    void validateAlignment(unsigned offset, int section) const
-    {
-        validate(section, offset, (offset & 0x3) == 0, "All items in the section must be 32-bit aligned");
-    }
-
     void validateSection(int section)
     {
         unsigned offset = 0;
-        unsigned size = getSectionSize(section);
+        unsigned secSize = getSectionSize(section);
 
-        map[section].reserve(size / AVR_ITEM_SIZE);
+        map[section].reserve(secSize / AVR_ITEM_SIZE);
 
-        validate(section, 0, getSectionData<uint32_t>(section, 0) == size, "Section must start with 32-bit section size");
+        validate(section, 0, getSectionData<uint32_t>(section, 0) == secSize, "Section must start with 32-bit section size");
 
-        for (offset = BRIG_NUM_BYTES_RESERVED; offset < size; )
+        for (offset = BRIG_NUM_BYTES_RESERVED; offset < secSize; )
         {
-            validateAlignment(offset, section);
             validate(section, offset,
-                     offset + 2 * sizeof(uint16_t) <= size, // Each entry must start with 2 16-bit fields
+                     offset + 4 <= secSize, // Each entry must start with 32-bit header
                      "Last item does not fit in section");
 
-            uint16_t itemSize = getSectionData<uint16_t>(section, offset);
-            uint16_t itemKind = getSectionData<uint16_t>(section, offset + sizeof(uint16_t));
-            size_t   minItemSize = getMinItemSize(section, offset, itemKind);
+            unsigned itemSize    = getItemSize(section, offset);
+            unsigned minItemSize = getMinItemSize(section, offset);
 
-            validate(section, offset, (itemSize & 0x3) == 0, "Item size must be a multiple of 4");
-            validate(section, offset, minItemSize <= itemSize, "Invalid item size");
-            validate(section, offset, offset + itemSize <= size, "Item does not fit in section");
+            validate(section, offset, (itemSize & 0x3) == 0,        "Item size must be a multiple of 4");
+            validate(section, offset, minItemSize <= itemSize,      "Invalid item size");
+            validate(section, offset, offset + itemSize <= secSize, "Item does not fit in section");
+
+            validatePadding(section, offset);
 
             map[section].push_back(offset);
 
             offset += itemSize;
         }
 
-        assert(offset == size);
+        assert(offset == secSize);
     }
 
     void validateStringSection()
     {
-        unsigned offset = 0;
-        int section = BRIG_SEC_STRTAB;
-        unsigned size = getSectionSize(section);
+        vector<unsigned> strmap = map[BRIG_SEC_STRTAB];
+        const char* start = getSectionAddr(BRIG_SEC_STRTAB);
 
-        map[section].reserve(size / AVR_ITEM_SIZE);
+        validateSection(BRIG_SEC_STRTAB);
 
-        validate(section, 0, getSectionData<uint32_t>(section, 0) == size, "Section must start with 32-bit section size");
-
-        for (offset = BRIG_NUM_BYTES_RESERVED; offset < size; )
+        // Validate that all items are unique
+        for (unsigned i = 0; i < strmap.size(); ++i)
         {
-            validateAlignment(offset, section);
-            validate(section, offset,
-                     offset + sizeof(uint32_t) <= size, // Each entry must start with a 32-bit field
-                     "Last item does not fit in section");
+            unsigned    iSize = getItemSize(BRIG_SEC_STRTAB, strmap[i]);
+            const char* iData = start + strmap[i] + 4;
 
+            for (unsigned j = i + 1; j < strmap.size(); ++j)
+            {
+                unsigned jSize = getItemSize(BRIG_SEC_STRTAB, strmap[j]);
+                if (iSize == jSize)
+                {
+                    const char* jData = start + strmap[j] + 4;
+                    validate(BRIG_SEC_STRTAB, strmap[i], memcmp(iData, jData, iSize) != 0, "Identical entries in string section are not allowed");
+                }
+            }
+        }
+    }
+
+    void validatePadding(int section, unsigned offset) const
+    {
+        if (section == BRIG_SEC_STRTAB)
+        {
             uint32_t dataSize = getSectionData<uint32_t>(section, offset);
             uint32_t itemSize = ((dataSize + 7) / 4) * 4;
-
-            validate(section, offset, offset + itemSize <= size, "Item does not fit in section");
 
             for (unsigned i = offset + 4 + dataSize; i < offset + itemSize; ++i)
             {
                 validate(section, offset, getSectionData<uint8_t>(section, i) == 0, "Padding bytes at the end of string elements must be 0");
             }
-
-            map[section].push_back(offset);
-
-            offset += itemSize;
         }
+    }
 
-        assert(offset == size);
-
-        // Validate that all items are unique
-        for (unsigned i = 0; i < map[section].size(); ++i)
+    unsigned getItemSize(int section, unsigned offset) const
+    {
+        if (section == BRIG_SEC_STRTAB)
         {
-            uint32_t    mSize = getSectionData<uint32_t>(section, map[section][i]);
-            const char* mData = getSectionAddr(section) + map[section][i] + 4;
-            for (unsigned j = i + 1; j < map[section].size(); ++j)
-            {
-                uint32_t size = getSectionData<uint32_t>(section, map[section][j]);
-                if (mSize == size)
-                {
-                    const char* data = getSectionAddr(section) + map[section][j] + 4;
-                    validate(BRIG_SEC_STRTAB, map[section][i], memcmp(mData, data, size) != 0, "Identical entries in string section are not allowed");
-                }
-            }
+            return ((getSectionData<uint32_t>(section, offset) + 7) / 4) * 4;
         }
+        else
+        {
+            return getSectionData<uint16_t>(section, offset);
+        }
+    }
+
+    unsigned getMinItemSize(int section, unsigned offset) const
+    {
+        if (section == BRIG_SEC_STRTAB) return BRIG_MIN_STRTAB_ITEM_SIZE;
+
+        int result = 0;
+        uint16_t itemKind = getSectionData<uint16_t>(section, offset + sizeof(uint16_t));
+
+        if (section == BRIG_SEC_DIRECTIVES)
+        {
+            result = size_of_directive(itemKind);
+        }
+        else if (section == BRIG_SEC_CODE)
+        {
+            result = size_of_inst(itemKind);
+        }
+        else if (section == BRIG_SEC_OPERANDS)
+        {
+            result = size_of_operand(itemKind);
+        }
+
+        validate(section, offset, result > 0, "Invalid item kind");
+        return result;
     }
 
     //-------------------------------------------------------------------------
@@ -1850,11 +2028,13 @@ private:
         }
     }
 
-    // validate that:
-    // - offset is a valid offset to string section
+    // Validate reference to data in string section:
+    // - offset must be a valid offset to string section
     // - required data size = item data size
     void validateStringData(Directive d, unsigned offset, unsigned type, unsigned length, const char* structName, const char* fieldName)
     {
+        assert(type != Brig::BRIG_TYPE_B1); // b1 is not allowed in initializers and block directives
+
         validateOffset(d, BRIG_SEC_STRTAB, offset, structName, fieldName);
 
         uint32_t dataSize = getSectionData<uint32_t>(BRIG_SEC_STRTAB, offset);
@@ -1868,7 +2048,7 @@ private:
         validate(d, len == argNum, "Control directive has invalid number of operands");
 
         // directive size must be large enough to hold all array elements
-        unsigned available = d.brig()->size - offsetof(Brig::BrigDirectiveControl, values);  //F refactoring needed: this code is used several times
+        unsigned available = d.brig()->size - offsetof(Brig::BrigDirectiveControl, values);
         validate(d, sizeof(Offset) * len <= available, "Invalid DirectiveControl size");
 
         for (unsigned i = 0; i < len; ++i)
@@ -1877,13 +2057,12 @@ private:
             if (OperandImmed imm = opr)
             {
                 unsigned val = *reinterpret_cast<const uint32_t*>(&imm.brig()->bytes[0]);
-                validate(imm, imm.type() == Brig::BRIG_TYPE_B32, "Invalid operand of control directive (expected u32 immediate)");
-                validate(imm, min <= val && val <= max, "Invalid operand of control directive (incorrect immediate value)");
+                validate(imm, getImmSize(imm) == 32, "Invalid operand size, expected u32");
+                validate(imm, min <= val && val <= max, "Invalid operand (incorrect immediate value)");
             }
             else if (OperandWavesize ws = opr)
             {
-                validate(ws, isWsValid, "Invalid operand of control directive (wavesize is not accepted)");
-                validate(ws, ws.type() == Brig::BRIG_TYPE_B32, "Invalid operand of control directive (expected u32 wavesize)");
+                validate(ws, isWsValid, "Invalid operand (wavesize is not accepted)");
             }
             else
             {
@@ -1897,7 +2076,7 @@ private:
         assert(d);
 
         using namespace Brig;
-        switch (getKind(d))
+        switch (d.kind())
         {
         case BRIG_DIRECTIVE_KERNEL:
         case BRIG_DIRECTIVE_FUNCTION:
@@ -1910,10 +2089,8 @@ private:
             }
             break;
         case BRIG_DIRECTIVE_VARIABLE:
-        case BRIG_DIRECTIVE_IMAGE:
-        case BRIG_DIRECTIVE_SAMPLER:
             {
-                validateType(d);
+                validateVarType(DirectiveVariable(d));
                 validateName(d, "%&");
                 validateSegment(d);
                 validateSymAttr(d);
@@ -2008,7 +2185,7 @@ private:
             break;
 
         case BRIG_DIRECTIVE_LABEL_TARGETS:
-            //F check validation of labeltargets
+            validateName(d, "%");
             validateLabelList<DirectiveLabelTargets, Brig::BrigDirectiveLabelTargets>(d);
             break;
 
@@ -2018,10 +2195,6 @@ private:
                 string text = SRef(c.name());
                 validate(c, text.find("//") == 0, "Comment must start with \"//\"");
             }
-            break;
-
-        case BRIG_DIRECTIVE_FILE:
-            // Nothing to validate
             break;
 
         case BRIG_DIRECTIVE_SIGNATURE:
@@ -2043,12 +2216,11 @@ private:
                     SymbolModifier mod = proto.args(i).modifier();
 
                     // type must be any valid type except for b1.
-                    validate(d, HSAIL_ASM::typeX2str(type) != 0 && type != Brig::BRIG_TYPE_B1, "Invalid argument type");
+                    validate(d, typeX2str(type) != 0 && isValidVarType(type), "Invalid argument type");
 
-                    // align must be one of the following values: 1, 2, 4, 8
-                    validate_Alignment(d, align);
+                    validate_BrigAlignment(d, align, "DirectiveSignatureArgument", "align");
 
-                    validate(d, checkAlign(align, type),
+                    validate(d, isValidAlignment(align, type),
                              "Specified alignment must be greater than or equal to natural alignment");
 
                     validate(d, mod.isDeclaration(), "Signature arguments cannot be defined, only declared");
@@ -2080,7 +2252,11 @@ private:
         case BRIG_DIRECTIVE_VERSION:    break;
         case BRIG_DIRECTIVE_EXTENSION:  break;
 
-        case BRIG_DIRECTIVE_LOC:        break;
+        case BRIG_DIRECTIVE_LOC:        
+            validate(d, DirectiveLoc(d).line()   != 0, "Invalid loc directive, line number must be greater than 0");
+            validate(d, DirectiveLoc(d).column() != 0, "Invalid loc directive, column number must be greater than 0");
+            break;
+
         case BRIG_DIRECTIVE_PRAGMA:     break;
 
         case Brig::BRIG_DIRECTIVE_BLOCK_START:
@@ -2093,21 +2269,11 @@ private:
 
                 validate(d, blkNum.elementCount() > 0, "Empty blocknumeric, expected at least one value");
 
-                switch (blkNum.type())
-                {
-                case BRIG_TYPE_NONE:
-                case BRIG_TYPE_B1:
-                case BRIG_TYPE_B128:
-                case BRIG_TYPE_SAMP:
-                case BRIG_TYPE_ROIMG:
-                case BRIG_TYPE_RWIMG:
-                case BRIG_TYPE_FBAR:
-                    validate(d, false, "Invalid blocknumeric type");
-                    break;
-
-                default:
-                    break;
-                }
+                unsigned type = blkNum.type();
+                validate(d, type != BRIG_TYPE_NONE && 
+                            type != BRIG_TYPE_B128 && 
+                            type != BRIG_TYPE_B1   && 
+                            !isOpaqueType(type), "Invalid blocknumeric type");
 
                 validateStringData(d, blkNum.brig()->data, blkNum.type(), blkNum.elementCount(), "BlockNumeric", "data");
             }
@@ -2140,11 +2306,10 @@ private:
         for (unsigned i = 0; i < list.elementCount(); ++i)
         {
             // Offsets in this array have not been validated yet
-            validate_dOffset(list, list.brig()->labels[i], DirectiveLabelInit(list)? "DirectiveLabelInit" : "DirectiveLabelTargets", "labels[*]");
+            validate_BrigDirectiveOffset(list, list.brig()->labels[i], DirectiveLabelInit(list)? "DirectiveLabelInit" : "DirectiveLabelTargets", "labels[*]");
 
             // Each element must refer DirectiveLabel
-            Directive d(list.container(), list.brig()->labels[i]);
-            validate(list, DirectiveLabel(d), "Invalid reference to label");
+            validate(list, isDirective<DirectiveLabel>(list.labels(i)), "Invalid reference to label");
         }
     }
 
@@ -2203,24 +2368,38 @@ private:
     {
         assert(addr);
 
-        validate(addr, addr.type() == Brig::BRIG_TYPE_B32 ||
-                       addr.type() == Brig::BRIG_TYPE_B64, "Invalid address type; must be b32 or b64");
+        // This is a low-level check to make sure that operand refers a DirectiveVariable
+        if (addr.brig()->symbol) validate(addr, isDirective<DirectiveVariable>(addr.symbol()), "Invalid symbol reference");
+        
+        // This is a low-level check to validate register name
+        if (addr.reg()) validateRegName(addr, addr.reg());
 
-        if (addr.brig()->symbol)
+        // Make sure all address elements specify the same size 
+        unsigned addrSize = getAddrSize(addr, isLargeModel()); // 32 or 64; 0 if both are valid
+        if (addrSize == 0) return; // nothing to validate: address is a 32-bit constant
+
+        // If the address size is 32 bits, then offsetHi must be 0.
+        // It is unclear from specification what is address size.
+        // Drop this check so we could emit negative 64 bit offsets 
+        // for 32 bit addresses in large model.
+        /*
+        if (addrSize == Brig::BRIG_TYPE_B32)
         {
-            // This is a low-level check to make sure that operand refers a DirectiveSymbol
-            Directive d(addr.container(), addr.brig()->symbol);
-            validate(addr, d && DirectiveSymbol(d), "Invalid symbol reference");
+             validate(addr, addr.offsetHi() == 0, "Malformed address: offset size does not match register or segment size");
+        }
+        */
 
+        if (addr.symbol())
+        {
 #if !ENABLE_ADDRESS_SIZE_CHECK
             // This is a temporary workaround for lowering
-            if (!isLargeModel() || getSegAddrSize(DirectiveSymbol(d).segment(), isLargeModel()) != 32 || getTypeSize(addr.type()) != 64)
+            if (!isLargeModel() || getSegAddrSize(addr.symbol().segment(), isLargeModel()) != 32 || addrSize == 32)
 #endif
-            validate(addr, getTypeSize(addr.type()) == getSegAddrSize(DirectiveSymbol(d).segment(), isLargeModel()),
-                     "Address type does not match segment address size");
+            validate(addr, addrSize == getSegAddrSize(addr.symbol().segment(), isLargeModel()),
+                     "Malformed address: segment size does not match register or offset size");
         }
 
-        if (addr.brig()->reg) validateAddrRef(addr, addr.type(), addr.reg());
+        if (addr.reg()) validate(addr, addrSize == getRegSize(addr.reg()), "Malformed address: register size does not match segment or offset size");
     }
 
     unsigned validateRegName(Operand opr, SRef reg) const
@@ -2259,8 +2438,7 @@ private:
         assert(r);
         validate(r, r.brig()->reg != 0, "Missing register reference in OperandReg");
 
-        unsigned type = validateRegName(r, r.reg());
-        validate(r, r.type() == type, "Invalid register type");
+        validateRegName(r, r.reg());
     }
 
     void validateRegV(OperandRegVector vector)
@@ -2270,11 +2448,6 @@ private:
         unsigned size = vector.elementCount();
         validate(vector, size == 2 || size == 3 || size == 4, "Vector must include 2, 3 or 4 registers");
 
-        unsigned vtype = vector.type();
-        validate(vector, vtype == Brig::BRIG_TYPE_B1
-                      || vtype == Brig::BRIG_TYPE_B32
-                      || vtype == Brig::BRIG_TYPE_B64, "Invalid vector type, expected b1, b32 or b64");
-
         // directive size must be large enough to hold all array elements
         unsigned available = vector.brig()->size - offsetof(Brig::BrigOperandRegVector, regs);
         validate(vector, sizeof(Offset) * vector.elementCount() <= available, "Invalid OperandRegVector size");
@@ -2283,42 +2456,21 @@ private:
         for (unsigned i = 0; i < size; ++i)
         {
             // This is a low-level check to make sure array of offsets refer register names
-            validate_sOffset(vector, vector.brig()->regs[i], "OperandRegVector", "regs[*]");
+            validate_BrigStringOffset(vector, vector.brig()->regs[i], "OperandRegVector", "regs[*]");
 
             unsigned type = validateRegName(vector, vector.regs(i));
             if (i == 0) rtype = type;
 
             validate(vector, rtype == type , "All registers in a vector must be of the same type");
         }
-
-        validate(vector, vtype == rtype, "Registers in a vector must have the same type as the vector");
     }
 
     void validateImm(OperandImmed imm) const
     {
         assert(imm);
-        validate(imm, isBitType(imm.type()), "Invalid type of immediate operand");
-
-        validate(imm, std::max(1U, getTypeSize(imm.type()) / 8) == imm.byteCount(), // 1 byte for b1
-                      "Immediate operand size does not match its type");
 
         unsigned available = imm.brig()->size - offsetof(Brig::BrigOperandImmed, bytes);
         validate(imm, imm.byteCount() <= available, "Invalid OperandImmed size");
-
-        // The b1 type uses a single byte which must be either be 0 or 1.
-        if (imm.type() == Brig::BRIG_TYPE_B1)
-        {
-            validate(imm, imm.bytes(0) == 0 || imm.bytes(0) == 1, "Immediate value of b1 type must be either 0 or 1");
-        }
-    }
-
-    void validateAddrRef(Operand parent, unsigned type, SRef reg) const
-    {
-        assert(parent);
-        assert(!reg.empty());
-
-        unsigned regType = validateRegName(parent, reg);
-        validate(parent, regType == type, "Register type does not match address type");
     }
 
     void validateOperandList(OperandList list)
@@ -2335,33 +2487,19 @@ private:
             validate(list, isArgList, "List of functions must include at least one element");
 
             // First array element is ALWAYS present. It should refer 0 if the list is empty
-            //F validate(list, list.brig()->elements[0] == 0, "First element of an empty argument list must be 0");
+            //F This check is turned off as current spec has no such requirement (but I believe it should)
+            // validate(list, list.brig()->elements[0] == 0, "First element of an empty argument list must be 0");
             return;
         }
 
         for (unsigned i = 0; i < list.elementCount(); ++i)
         {
             // make sure offset to an operand is valid
-            validate_dOffset(list, list.brig()->elements[i], isArgList? "OperandArgumentList" : "OperandFunctionList", "elements[*]");
+            validate_BrigDirectiveOffset(list, list.brig()->elements[i], isArgList? "OperandArgumentList" : "OperandFunctionList", "elements[*]");
 
             // all elements in the list must be of the same kind
             Directive d = list.elements(i);
-            validate(d, isArgList? (bool)DirectiveSymbol(d) : (bool)DirectiveFunction(d), "Invalid element kind");
-        }
-    }
-
-    bool chkAddrSize(unsigned type, unsigned segment) const
-    {
-        switch (segment)
-        {
-        case Brig::BRIG_SEGMENT_FLAT:
-        case Brig::BRIG_SEGMENT_GLOBAL:
-        case Brig::BRIG_SEGMENT_READONLY:
-        case Brig::BRIG_SEGMENT_KERNARG:
-            return type == (isLargeModel()? Brig::BRIG_TYPE_B64 : Brig::BRIG_TYPE_B32);
-
-        default:
-            return type == Brig::BRIG_TYPE_B32;
+            validate(d, isArgList? (bool)DirectiveVariable(d) : (bool)DirectiveFunction(d), "Invalid element kind");
         }
     }
 
@@ -2369,22 +2507,19 @@ private:
     void validateOperandRef(OperandRef opr, SRef msg)
     {
         // This is a low-level check to make sure operand refers proper directive
-        Directive d(opr.container(), opr.brig()->ref);
-        validate(opr, DirectiveType(d), msg);
+        validate(opr, isDirective<DirectiveType>(opr.ref()), msg);
     }
 
-    void validateLabelRef(OperandRef opr)
+    template <class DirectiveName> bool isDirective(Directive d) const
     {
-        // This is a low-level check to make sure operand refers proper directive
-        Directive d(opr.container(), opr.brig()->ref);
-        validate(opr, DirectiveLabel(d) || DirectiveLabelTargets(d), "Invalid reference to DirectiveLabel or DirectiveLabelTargets");
+        return DirectiveName(d);
     }
 
     void validateOperand(Operand opr)
     {
         assert(opr);
 
-        switch (getKind(opr))
+        switch (opr.kind())
         {
         case Brig::BRIG_OPERAND_ADDRESS:
             validateOperandAddress(opr);
@@ -2403,8 +2538,15 @@ private:
             break;
 
         case Brig::BRIG_OPERAND_LABEL_REF:
-            //F check validation of labeltargets
-            validateLabelRef(opr);
+            validateOperandRef<DirectiveLabel>(opr, "Invalid reference to label");
+            break;
+
+        case Brig::BRIG_OPERAND_LABEL_TARGETS_REF:
+            validateOperandRef<DirectiveLabelTargets>(opr, "Invalid reference to labeltargets");
+            break;
+
+        case Brig::BRIG_OPERAND_LABEL_VARIABLE_REF:
+            validateOperandRef<DirectiveVariable>(opr, "Invalid reference to variable");
             break;
 
         case Brig::BRIG_OPERAND_FUNCTION_REF:
@@ -2419,11 +2561,6 @@ private:
             validateOperandRef<DirectiveFbarrier>(opr, "Invalid reference to fbarrier");
             break;
 
-        case Brig::BRIG_OPERAND_ARGUMENT_REF: // delme
-            //F delme
-            assert(false);
-            break;
-
         case Brig::BRIG_OPERAND_REG:
             validateOperandReg(opr);
             break;
@@ -2433,11 +2570,7 @@ private:
             break;
 
         case Brig::BRIG_OPERAND_WAVESIZE:
-            {
-                unsigned type = OperandWavesize(opr).type();
-                validate(opr, isBitType(type) && type != Brig::BRIG_TYPE_B128, "Invalid wavesize type");
-            }
-            break;
+            break; // Nothing to do
 
         default:
             // should not get here!
@@ -2455,11 +2588,16 @@ private:
         validate(d, name.find_first_of(pref) == 0, "Invalid identifier prefix");
 
         // FIXME: temporarily disabled
-        //validate(d, name.find("__hsa") != 1, "Identifiers must not start with the characters '__hsa'");
+        //F validate(d, name.find("__hsa") != 1, "Identifiers must not start with the characters '__hsa'");
 
         validate(d, name.length() > 1 &&
                     name.find_first_of(ALPHA, 1) == 1 &&
                    (name.length() == 2 || name.find_first_not_of(ALPHANUM, 2) == string::npos), "Invalid identifier");
+    }
+
+    bool isImageOrSampler(Directive d) const {
+        DirectiveVariable v = d;
+        return v && (v.type()==Brig::BRIG_TYPE_SAMP || v.type()==Brig::BRIG_TYPE_RWIMG || v.type()==Brig::BRIG_TYPE_ROIMG);
     }
 
     void validateSegment(Directive d) const
@@ -2475,16 +2613,16 @@ private:
         }
 
         // Image and Sampler objects can be declared as either a global variable or a kernarg variable
-        if (DirectiveImage(d) || DirectiveSampler(d))
+        if (isImageOrSampler(d))
         {
             validate(d, isArgSeg(d) || isKernArgSeg(d) || isGlobalSeg(d) || isReadonlySeg(d),
-                     "Images and samplers may only be defined in arg, kernarg, global and readonly segments");
+                        "Images and samplers may only be defined in arg, kernarg, global and readonly segments");
         }
     }
 
-    void validateSymAttr(DirectiveSymbol d) const
+    void validateSymAttr(DirectiveVariable d) const
     {
-        assert(isSym(d));
+        assert(isVar(d));
 
         if (isDef(d))
         {
@@ -2539,6 +2677,7 @@ private:
             validate(d, !isExtern(d), "Kernels cannot be extern");
             validate(d, !isStatic(d), "Kernels cannot be static");
             validate(d, isDef(d),     "Kernels cannot have declarations");
+            validate(d, getOperationNum(d) > 0, "Kernel must have at least one instruction");
         }
         else
         {
@@ -2546,6 +2685,7 @@ private:
 
             if (isDef(d))
             {
+                validate(d, getOperationNum(d) > 0, "Function definition must have at least one instruction");
                 validate(d, !isExtern(d), "Function definition cannot be extern");
             }
             else
@@ -2555,40 +2695,15 @@ private:
         }
     }
 
-    void validateType(Directive d) const
+    void validateVarType(DirectiveVariable var) const
     {
-        assert(isSym(d));
-
-        unsigned type = getDataType(d);
-
-        if (DirectiveVariable(d))
-        {
-            validate(d, type != Brig::BRIG_TYPE_RWIMG &&
-                        type != Brig::BRIG_TYPE_ROIMG &&
-                        type != Brig::BRIG_TYPE_SAMP,
-                        "Invalid symbol type");
-
-            validate(d, type != Brig::BRIG_TYPE_B1, "b1 is not a valid type for arguments and variables");
-        }
-        else if (DirectiveImage(d))
-        {
-            validate(d, type == Brig::BRIG_TYPE_RWIMG || type == Brig::BRIG_TYPE_ROIMG,
-                     "Image type must be either RWImg or ROImg");
-        }
-        else if (DirectiveSampler(d))
-        {
-            validate(d, type == Brig::BRIG_TYPE_SAMP, "Sampler must have Samp type");
-        }
-        else
-        {
-            assert(false);
-        }
+        validate(var, isValidVarType(var.type()), "Invalid symbol type");
     }
 
     void validateAlign(Directive d) const
     {
-        assert(isSym(d));
-        validate(d, checkAlign(getAlignment(d), getDataType(d)),
+        assert(isVar(d));
+        validate(d, isValidAlignment(getAlignment(d), getDataType(d)),
                  "Specified alignment must be greater than or equal to natural alignment");
     }
 
@@ -2599,17 +2714,17 @@ private:
                        "Invalid DirectiveVariableInit type, expected b8, b16, b32, b64 or b128");
     }
 
-    void validateInit(DirectiveSymbol sym)
+    void validateInit(DirectiveVariable sym)
     {
         assert(sym);
 
         Directive d = sym.init();
         // This is a low-level check to make sure that initializer (if any) has the correct type
         validate(sym, !d ||
-                      isa<DirectiveVariableInit>(d) || //F use for all low-level checks
-                      isa<DirectiveImageInit>(d) ||
-                      isa<DirectiveSamplerInit>(d) ||
-                      isa<DirectiveLabelInit>(d),
+                      isDirective<DirectiveVariableInit>(d) ||
+                      isDirective<DirectiveImageInit>(d)    ||
+                      isDirective<DirectiveSamplerInit>(d)  ||
+                      isDirective<DirectiveLabelInit>(d),
                      "Invalid initializer type");
 
         if (isConst(sym))
@@ -2623,18 +2738,6 @@ private:
             validate(sym, isDef(sym), "Variable declaration cannot have initializer");
             validate(sym, isGlobalSeg(sym) || isReadonlySeg(sym),
                      "Only variables in global and readonly segments may be initialized");
-        }
-        else // No initializer
-        {
-            ///if (isArgSeg(sym) || isKernArgSeg(sym)) // This check is added to improve error reporting
-            ///{
-            ///    validate(sym, !isConst(sym), "Arguments cannot be const");
-            ///}
-            ///else // const definition => must have initializer
-            ///{
-            ///    //F According to new spec, initializer is optional
-            ///    //F if (isConst(sym)) validate(sym, isDecl(sym), "Const variable definitions must have initializer");
-            ///}
         }
 
         if (!d)
@@ -2668,14 +2771,14 @@ private:
         }
         else if (DirectiveImageInit init = d)
         {
-            validate(sym, DirectiveImage(sym), "Variables and Samplers cannot be initialized with ImageInit");
+            validate(sym, sym.type()==Brig::BRIG_TYPE_RWIMG || sym.type()==Brig::BRIG_TYPE_ROIMG, "Variables and Samplers cannot be initialized with ImageInit");
             validate(sym, getArraySize(sym) <= 1, "Arrays of images with dim > 1 cannot be initialized");
 
             validate(sym, isGlobalSeg(sym) || isReadonlySeg(sym), "Image properties may only be defined in global and readonly segments");
         }
         else if (DirectiveSamplerInit init = d)
         {
-            validate(sym, DirectiveSampler(sym), "Variables and Images cannot be initialized with SamplerInit");
+            validate(sym, sym.type()==Brig::BRIG_TYPE_SAMP, "Variables and Images cannot be initialized with SamplerInit");
             validate(sym, getArraySize(sym) <= 1, "Arrays of images with dim > 1 cannot be initialized");
 
             validate(sym, isGlobalSeg(sym) || isReadonlySeg(sym), "Sampler properties may only be defined in global and readonly segments");
@@ -2696,9 +2799,12 @@ private:
 
     void validateArgs(Directive d)
     {
-        if (isKernel(d)) {
+        if (isKernel(d))
+        {
             validate(d, getOutParamNum(d) == 0, "Kernels cannot have output parameters");
-        } else {
+        }
+        else
+        {
             validate(d, getOutParamNum(d) <= 1, "Functions cannot have more than one output parameter");
         }
 
@@ -2721,7 +2827,7 @@ private:
         for (unsigned i = 0; i < paramNum; ++i)
         {
             validate(sbr, arg,        "Insufficient number of parameters");
-            validate(arg, isSym(arg), "Invalid directive, expected kernel/function parameter");
+            validate(arg, isVar(arg), "Invalid directive, expected kernel/function parameter");
             validate(arg, getSegment(arg) == seg, "Invalid segment");
 
             if (isFlex(arg)) validate(arg, isInputArgs && i == paramNum - 1, "Flexible array is only allowed as the last function argument");
@@ -2751,9 +2857,9 @@ private:
         for (; ds != end; ds = ds.next())
         {
             validate(ds, isBodyStatement(ds), "Directive is not allowed inside kernel or function");
-            validate(ds, (!DirectiveImage(ds) && !DirectiveSampler(ds)) || isArgSeg(ds),
+            validate(ds, !isImageOrSampler(ds) || isArgSeg(ds),
                      "Images and samplers defined in kernel/function body must be allocated in arg segment");
-            validate(ds, !isSym(ds) || !isFlex(ds),
+            validate(ds, !isVar(ds) || !isFlex(ds),
                      "Flexible array may only be defined as the last function argument");
         }
     }
@@ -2780,11 +2886,11 @@ private:
         {
             validate(out, fn.outArgCount() == out.elementCount(), "Invalid number of output parameters");
 
-            DirectiveSymbol formalArg = fn.next();
+            DirectiveVariable formalArg = fn.next();
             for (unsigned i = 0; i < fn.outArgCount(); ++i)
             {
                 assert(formalArg);                          // Validated on previous steps
-                assert(DirectiveSymbol(out.elements(i)));   // Validated on previous steps
+                assert(DirectiveVariable(out.elements(i)));   // Validated on previous steps
 
                 validateCallArg(out, out.elements(i), formalArg);
                 formalArg = formalArg.next();
@@ -2793,11 +2899,11 @@ private:
 
         validate(in, fn.inArgCount() == in.elementCount(), "Invalid number of input parameters");
 
-        DirectiveSymbol formalArg = fn.firstInArg(); // It is already validated that arguments are symbols
+        DirectiveVariable formalArg = fn.firstInArg(); // It is already validated that arguments are symbols
         for (unsigned i = 0; i < fn.inArgCount(); ++i)
         {
             assert(formalArg);                          // Validated on previous steps
-            assert(DirectiveSymbol(in.elements(i)));    // Validated on previous steps
+            assert(DirectiveVariable(in.elements(i)));    // Validated on previous steps
 
             validateCallArg(in, in.elements(i), formalArg);
             formalArg = formalArg.next();
@@ -2829,7 +2935,7 @@ private:
         }
     }
 
-    void validateCallArg(OperandArgumentList list, DirectiveSymbol actual, DirectiveSymbol formal) const
+    void validateCallArg(OperandArgumentList list, DirectiveVariable actual, DirectiveVariable formal) const
     {
         validateCallArg(list, actual, formal.type(), formal.align(), isArray(formal), formal.dim());
     }
@@ -2840,44 +2946,33 @@ private:
     // - Both are arrays with the same size and alignment and the elements have identical properties.
     // - Both are arrays with elements that have identical properties, both arrays have
     //   the same alignment, and the formal is a flexible array (of no specified size).
-    void validateCallArg(OperandArgumentList list, DirectiveSymbol actual, unsigned formalType, unsigned formalAlign, bool formalIsArray, uint64_t formalDim) const
+    void validateCallArg(OperandArgumentList list, DirectiveVariable actual, unsigned formalType, unsigned formalAlign, bool formalIsArray, uint64_t formalDim) const
     {
         assert(actual);
 
         validate(list, isArgSeg(actual), "Call arguments must be defined in arg segment");
 
         validate(list, formalType == actual.type(), "Incompatible types of formal and actual parameters");
-        validate(list, getPhysicalAlignment(formalType, formalAlign) == getPhysicalAlignment(actual), "Incompatible alignment of formal and actual parameters");
+        validate(list, formalAlign == actual.align(), "Incompatible alignment of formal and actual parameters");
 
-        if (formalIsArray) { // may be either array or flexible array
+        if (formalIsArray)  // may be either array or flexible array
+        {
             validate(list, isArray(actual), "Actual parameter must be an array");
             validate(list, !isFlex(actual), "Actual parameter must have fixed size (cannot be flexible array)");
             validate(list, formalDim == 0 || formalDim == actual.dim(), "Incompatible formal and actual parameters: arrays must have the same length");
-        } else {
+        }
+        else
+        {
             validate(list, !isArray(actual), "Actual parameter must be scalar (not array)");
         }
     }
 
     //-------------------------------------------------------------------------
-    // Basic Field Validation
+    //-------------------------------------------------------------------------
+    //-------------------------------------------------------------------------
+    // Low-level BRIG validation (functions used by autogenerated code)
 
-    template<class T> void validate_sOffset(T item, Brig::BrigStringOffset32_t offset, const char* structName, const char* fieldName, bool z = false) const
-    {
-        validateOffset(item, BRIG_SEC_STRTAB, offset, structName, fieldName, z);
-    }
-    template<class T> void validate_dOffset(T item, Brig::BrigDirectiveOffset32_t offset, const char* structName, const char* fieldName, bool z = false, bool ex = false) const
-    {
-        validateOffset(item, BRIG_SEC_DIRECTIVES, offset, structName, fieldName, z, ex);
-    }
-    template<class T> void validate_cOffset(T item, Brig::BrigCodeOffset32_t offset, const char* structName, const char* fieldName, bool z = false, bool ex = false) const
-    {
-        validateOffset(item, BRIG_SEC_CODE, offset, structName, "code", z, ex);
-    }
-    template<class T> void validate_oOffset(T item, Brig::BrigOperandOffset32_t offset, const char* structName, const char* fieldName, bool z = false) const
-    {
-        validateOffset(item, BRIG_SEC_OPERANDS, offset, structName, fieldName, z);
-    }
-
+    //F validateOffset: make 'z=false" default 
     template<class T> void validateOffset(T item, int section, unsigned offset, const char* structName, const char* fieldName, bool z = false, bool ex = false) const
     {
         assert(section == BRIG_SEC_DIRECTIVES ||
@@ -2890,7 +2985,8 @@ private:
         if (offset == 0 && !z)                        invalidOffset(item, section, structName, fieldName, "cannot be 0");
         if (offset > size || (offset == size && !ex)) invalidOffset(item, section, structName, fieldName, "is out of section");
 
-        if (offset > 0 && offset < size && !std::binary_search(map[section].begin(), map[section].end(), offset)) {
+        if (offset > 0 && offset < size && !std::binary_search(map[section].begin(), map[section].end(), offset))
+        {
             invalidOffset(item, section, structName, fieldName, "points at the middle of an item");
         }
     }
@@ -2913,213 +3009,274 @@ private:
         validate(item, false, "Invalid offset to " + msg + " section: " + structName + "." + fieldName + " " + errMsg);
     }
 
-    template<class T> void validate_ControlType(T item, unsigned type) const
+    void validate_BrigDirectiveOffset(Directive item, unsigned offset, const char* structName, const char* fieldName) const
     {
-        using namespace Brig;
-        switch(type)
-        {
-        case BRIG_CONTROL_ENABLEBREAKEXCEPTIONS:
-        case BRIG_CONTROL_ENABLEDETECTEXCEPTIONS:
-        case BRIG_CONTROL_MAXDYNAMICGROUPSIZE:
-        case BRIG_CONTROL_MAXFLATGRIDSIZE:
-        case BRIG_CONTROL_MAXFLATWORKGROUPSIZE:
-        case BRIG_CONTROL_REQUESTEDWORKGROUPSPERCU:
-        case BRIG_CONTROL_REQUIREDDIM:
-        case BRIG_CONTROL_REQUIREDGRIDSIZE:
-        case BRIG_CONTROL_REQUIREDWORKGROUPSIZE:
-        case BRIG_CONTROL_REQUIRENOPARTIALWORKGROUPS:
-            return;
-        default:
-            validate(item, false, "Invalid ControlType value");
-        }
+        bool z = DirectiveVariable(item);
+        bool ex = DirectiveExecutable(item);
+        validateOffset(item, BRIG_SEC_DIRECTIVES, offset, structName, fieldName, z, ex);
+    }
+
+    void validate_BrigDirectiveOffset(Operand item, unsigned offset, const char* structName, const char* fieldName) const
+    {
+        bool z = OperandAddress(item);
+        validateOffset(item, BRIG_SEC_DIRECTIVES, offset, structName, fieldName, z);
+    }
+
+    template<class T> void validate_BrigCodeOffset(T item, unsigned offset, const char* structName, const char* fieldName) const
+    {
+        validateOffset(item, BRIG_SEC_CODE, offset, structName, "code", false, true); //F should it be 'false', 'false'?
+    }
+
+    template<class T> void validate_BrigOperandOffset(T item, unsigned offset, const char* structName, const char* fieldName) const
+    {
+        validateOffset(item, BRIG_SEC_OPERANDS, offset, structName, fieldName, true);
+    }
+
+    void validate_BrigStringOffset(Directive item, unsigned offset, const char* structName, const char* fieldName) const
+    {
+        validateOffset(item, BRIG_SEC_STRTAB, offset, structName, fieldName, false);
+    }
+    
+    void validate_BrigStringOffset(Operand item, unsigned offset, const char* structName, const char* fieldName) const
+    {
+        bool z = OperandAddress(item);
+        validateOffset(item, BRIG_SEC_STRTAB, offset, structName, fieldName, z);
+    }
+    
+    void validate_BrigDataOffset(Directive item, unsigned offset, const char* structName, const char* fieldName) const
+    {
+        validateOffset(item, BRIG_SEC_STRTAB, offset, structName, fieldName, false);
+    }
+
+    //-------------------------------------------------------------------------
+    //F improve diagnostics for this and subsequent checks
+    template<class T> void validate_BrigType(T item, unsigned val, const char* structName, const char* fieldName) const 
+    {
+        validate(item, typeX2str(val) != NULL, "Invalid data type value", val);
+    }
+
+    template<class T> void validate_BrigSegment(T item, unsigned val, const char* structName, const char* fieldName) const
+    {
+        validate(item, segment2str(val) != NULL, "Invalid segment value", val);
+    }
+
+    template<class T> void validate_BrigAlignment(T item, unsigned val, const char* structName, const char* fieldName) const
+    {
+        validate(item, align2str(val) != NULL, "Invalid alignment value", val);
+    }
+
+    template<class T> void validate_BrigImageGeometry(T item, unsigned val, const char* structName, const char* fieldName) const
+    {
+        const char* s = imageGeometry2str(val);
+        validate(item, s != NULL, "Invalid image geometry value", val);
+        validate(item, *s != 0,   "Unspecified image geometry");
     }
 
     template<class T> void validateLinkage(T item, unsigned linkage) const
     {
         using namespace Brig;
-        validate(item, linkage == BRIG_LINKAGE_EXTERN || linkage == BRIG_LINKAGE_STATIC || linkage == BRIG_LINKAGE_NONE, "Invalid Linkage value");
+        validate(item, linkage == BRIG_LINKAGE_EXTERN || linkage == BRIG_LINKAGE_STATIC || linkage == BRIG_LINKAGE_NONE, "Invalid linkage value", linkage);
     }
 
-    template<class T> void validate_ExecMod(T item, unsigned mod) const
+    void validate_BrigExecutableModifier(Directive item, Brig::BrigExecutableModifier val, const char* structName, const char* fieldName) const
     {
         using namespace Brig;
+
+        unsigned mod = val.allBits;
         unsigned linkage = mod & BRIG_EXECUTABLE_LINKAGE;
         unsigned mask = BRIG_EXECUTABLE_LINKAGE | BRIG_EXECUTABLE_DECLARATION;
 
-        validate(item, (mod & ~mask) == 0, "Invalid ExecutableModifier value");
+        validate(item, (mod & ~mask) == 0, "Invalid executable modifier value", mod);
         validateLinkage(item, linkage);
     }
 
-    template<class T> void validate_SymMod(T item, unsigned mod) const
+    void validate_BrigSymbolModifier(Directive item, Brig::BrigSymbolModifier val, const char* structName, const char* fieldName) const
     {
         using namespace Brig;
+
+        unsigned mod = val.allBits;
         unsigned linkage = mod & BRIG_SYMBOL_LINKAGE;
         unsigned mask = BRIG_SYMBOL_LINKAGE | BRIG_SYMBOL_DECLARATION | BRIG_SYMBOL_CONST | BRIG_SYMBOL_ARRAY | BRIG_SYMBOL_FLEX_ARRAY;
 
-        validate(item, (mod & ~mask) == 0, "Invalid SymbolModifier value");
-        validate(item, (mod & BRIG_SYMBOL_FLEX_ARRAY) == 0 || (mod & BRIG_SYMBOL_ARRAY) != 0, "Invalid SymbolModifier value: 'flex' = 1, but 'array' = 0");
+        validate(item, (mod & ~mask) == 0, "Invalid symbol modifier value", mod);
+        validate(item, (mod & BRIG_SYMBOL_FLEX_ARRAY) == 0 || (mod & BRIG_SYMBOL_ARRAY) != 0, "Invalid symbol modifier value ('flex' = 1, but 'array' = 0)", mod);
         validateLinkage(item, linkage);
     }
 
-    template<class T> void validate_Segment(T item, unsigned seg) const
-    {
-        validate(item, HSAIL_ASM::segment2str(seg) != NULL, "Invalid StorageClass value");
-    }
-
-    template<class T> void validate_DataType(T item, unsigned type) const
-    {
-        validate(item, HSAIL_ASM::typeX2str(type) != NULL, "Invalid DataType value");
-    }
-
-    template<class T> void validate_ImageOrder(T item, unsigned order) const
-    {
-        validate(item, HSAIL_ASM::imageOrder2str(order) != NULL, "Invalid ImageOrder value");
-    }
-
-    template<class T> void validate_ImageFormat(T item, unsigned format) const
-    {
-        validate(item, HSAIL_ASM::imageFormat2str(format) != NULL, "Invalid ImageFormat value");
-    }
-
-    template<class T> void validate_Machine(T item, unsigned machineModel) const
-    {
-        validate(item, HSAIL_ASM::machineModel2str(machineModel) != NULL, "Invalid Machine Model value");
-    }
-
-    template<class T> void validate_Profile(T item, unsigned profile) const
-    {
-        validate(item, HSAIL_ASM::profile2str(profile) != NULL, "Invalid Version Profile value");
-    }
-
-    template<class T> void validate_Opcode  (T item, unsigned opcode) const
-    {
-        validate(item, HSAIL_ASM::opcode2str(opcode) != NULL, "Invalid Opcode value");
-    }
-
-    template<class T> void validate_AtomicOp(T item, unsigned opr) const
-    {
-        validate(item, HSAIL_ASM::atomicOperation2str(opr) != NULL, "Invalid AtomicOperation");
-    }
-
-    template<class T> void validate_MemSem(T item, unsigned sem) const
-    {
-        validate(item, HSAIL_ASM::memorySemantic2str(sem) != NULL, "Invalid MemorySemantic value");
-    }
-
-    template<class T> void validate_Geom(T item, unsigned geom) const
-    {
-        validate(item, HSAIL_ASM::imageGeometry2str(geom) != NULL, "Invalid Geom value");
-    }
-
-    template<class T> void validate_CmpOp(T item, unsigned opr) const
-    {
-        validate(item, HSAIL_ASM::compareOperation2str(opr) != NULL, "Invalid CompareOperation");
-    }
-
-    template<class T> void validate_Packing(T item, unsigned packing) const
-    {
-        validate(item, HSAIL_ASM::pack2str(packing) != NULL, "Invalid Packing value");
-    }
-
-    template<class T> void validate_EquivalenceClass(T item, unsigned equiv) const
-    {
-        validate(item, equiv <= 255, "Invalid Equivalence Class value");
-    }
-
-    void validate_SamplerModifier(Directive item, unsigned val) const
-    {
-        using namespace Brig;
-        validate(item, (val & ~(BRIG_SAMPLER_FILTER | BRIG_SAMPLER_COORD)) == 0, "Invalid Sampler modifier");
-    }
-
-    template<class T> void validate_MemMod(T item, unsigned val) const
-    {
-        using namespace Brig;
-        validate(item, (val & ~(BRIG_MEMORY_SEMANTIC | BRIG_MEMORY_ALIGNED)) == 0, "Invalid Memory modifier");
-    }
-
-    void validate_SamplerBoundary(Directive item, uint8_t boundary) const
+    void validate_BrigSamplerModifier(Directive item, Brig::BrigSamplerModifier val, const char* structName, const char* fieldName) const
     {
         using namespace Brig;
 
-        validate(item, boundary == BRIG_BOUNDARY_CLAMP
-                    || boundary == BRIG_BOUNDARY_WRAP
-                    || boundary == BRIG_BOUNDARY_MIRROR
-                    || boundary == BRIG_BOUNDARY_MIRRORONCE
-                    || boundary == BRIG_BOUNDARY_BORDER, "Invalid Sampler 'boundary' value");
+        unsigned mod = val.allBits;
+        validate(item, (mod & ~(BRIG_SAMPLER_FILTER | BRIG_SAMPLER_COORD)) == 0, "Invalid sampler modifier value", mod);
     }
 
-    template<class T> void validate_Alignment(T item, unsigned val) const
-    {
-        validate(item, val == 0 || val == 1 || val == 2 || val == 4 || val == 8 || val == 16, "Invalid alignment value, expected 0, 1, 2, 4, 8 or 16");
-    }
-
-    template<class T> void validate_Fence(T item, unsigned val) const
+    void validate_BrigAluModifier(Inst item, Brig::BrigAluModifier val, const char* structName, const char* fieldName) const
     {
         using namespace Brig;
-        validate(item, val == BRIG_FENCE_NONE         ||
-                       val == BRIG_FENCE_GROUP        ||
-                       val == BRIG_FENCE_GLOBAL       ||
-                       val == BRIG_FENCE_BOTH         ||
-                       val == BRIG_FENCE_PARTIAL      ||
-                       val == BRIG_FENCE_PARTIAL_BOTH, "Invalid SyncFlags value");
+
+        unsigned mod = val.allBits;
+        validate(item, (mod & ~(BRIG_ALU_ROUND | BRIG_ALU_FTZ)) == 0, "Invalid ALU modifier value", mod);
     }
 
-    template<class T> void validate_Width(T item, unsigned val) const
-    {
-        validate(item, HSAIL_ASM::width2str(val) != NULL, "Invalid Width value");
-    }
-
-    template<class T> void validate_AluMod(T item, unsigned val) const
+    void validate_BrigMemoryModifier(Inst item, Brig::BrigMemoryModifier val, const char* structName, const char* fieldName) const
     {
         using namespace Brig;
-        validate(item, (val & ~(BRIG_ALU_ROUND | BRIG_ALU_FTZ)) == 0, "Invalid SymbolModifier value");
+
+        unsigned mod = val.allBits;
+        validate(item, (mod & ~BRIG_MEMORY_CONST) == 0, "Invalid memory modifier (const) value", mod);
     }
 
-    template<class T> void validate_Reserved(T item, unsigned reserved) const
+    void validate_BrigSegCvtModifier(Inst item, Brig::BrigSegCvtModifier val, const char* structName, const char* fieldName) const
     {
-        validate(item, reserved == 0, "Invalid reserved field value; must be 0");
+        using namespace Brig;
+
+        unsigned mod = val.allBits;
+        validate(item, (mod & ~BRIG_SEGCVT_NONULL) == 0, "Invalid segcvt modifier value", mod);
+    }
+
+    void validate_BrigControlDirective(Directive item, unsigned val, const char* structName, const char* fieldName) const
+    {
+        validate(item, controlDirective2str(val) != NULL, "Invalid control type value", val);
+    }
+
+    void validate_BrigImageOrder(Directive item, unsigned val, const char* structName, const char* fieldName) const
+    {
+        const char* s = imageOrder2str(val);
+        validate(item, s != NULL , "Invalid image order value", val);
+        validate(item, *s != 0,    "Unspecified image order");
+    }
+
+    void validate_BrigImageFormat(Directive item, unsigned val, const char* structName, const char* fieldName) const
+    {
+        const char* s = imageFormat2str(val);
+        validate(item, s != NULL, "Invalid image format value", val);
+        validate(item, *s != 0,   "Unspecified image format");
+    }
+
+    void validate_BrigProfile(Directive item, unsigned val, const char* structName, const char* fieldName) const
+    {
+        validate(item, profile2str(val) != NULL, "Invalid version profile value", val);
+    }
+
+    void validate_BrigMachineModel(Directive item, unsigned val, const char* structName, const char* fieldName) const
+    {
+        validate(item, machineModel2str(val) != NULL, "Invalid machine model value", val);
+    }
+
+    void validate_BrigSamplerBoundaryMode(Directive item, unsigned val, const char* structName, const char* fieldName) const
+    {
+        validate(item, samplerBoundaryMode2str(val) != NULL, "Invalid sampler boundary value", val);
+    }
+
+    void validate_BrigOpcode(Inst item, unsigned val, const char* structName, const char* fieldName) const
+    {
+        validate(item, opcode2str(val) != NULL, "Invalid opcode value", val);
+    }
+
+    void validate_BrigMemoryOrder(Inst item, unsigned val, const char* structName, const char* fieldName) const
+    {
+        validate(item, memoryOrder2str(val) != NULL, "Invalid memoryOrder value", val);
+    }
+
+    void validate_BrigMemoryScope(Inst item, unsigned val, const char* structName, const char* fieldName) const
+    {
+        validate(item, memoryScope2str(val) != NULL, "Invalid memoryScope value", val);
+    }
+
+    void validate_BrigAtomicOperation(Inst item, unsigned val, const char* structName, const char* fieldName) const
+    {
+        validate(item, atomicOperation2str(val) != NULL, "Invalid atomicOperation value", val);
+    }
+
+    void validate_BrigWidth(Inst item, unsigned val, const char* structName, const char* fieldName) const
+    {
+        validate(item, width2str(val) != NULL, "Invalid width value", val);
+    }
+
+    void validate_BrigCompareOperation(Inst item, unsigned val, const char* structName, const char* fieldName) const
+    {
+        validate(item, compareOperation2str(val) != NULL, "Invalid compare operation value", val);
+    }
+
+    void validate_BrigPack(Inst item, unsigned val, const char* structName, const char* fieldName) const
+    {
+        validate(item, pack2str(val) != NULL, "Invalid pack value", val);
+    }
+
+    void validate_BrigMemoryFenceSegments(Inst item, unsigned val, const char* structName, const char* fieldName) const
+    {
+        validate(item, memoryFenceSeg2str(val) != NULL, "Invalid memoryFence value", val);
+    }
+
+    void validate_BrigSignalOperation(Inst item, unsigned val, const char* structName, const char* fieldName) const
+    {
+        validate(item, signalOperation2str(val) != NULL, "Invalid signalOperation value", val);
+    }
+
+    void validate_ImageDim(DirectiveImageInit item, unsigned dim, const char* name,  bool isPositive) const
+    {
+        string geom = imageGeometry2str(item.geometry());
+        const char* msg = isPositive? " must be positive" : " must be 0";
+        validate(item, (dim > 0) == isPositive, "Invalid " + geom + " image initializer; " + name + msg);
+    }
+
+    void validate_fld_Width(Directive item, unsigned val, const char* structName, const char* fieldName) const
+    {
+        validate_ImageDim(item, val, fieldName,  true);
+    }
+
+    void validate_fld_Height(Directive item, unsigned val, const char* structName, const char* fieldName) const
+    {
+        unsigned geom = DirectiveImageInit(item).geometry();
+        validate_ImageDim(item, val, fieldName, geom == Brig::BRIG_GEOMETRY_2D || geom == Brig::BRIG_GEOMETRY_3D || geom == Brig::BRIG_GEOMETRY_2DA);
+    }
+
+    void validate_fld_Depth(Directive item, unsigned val, const char* structName, const char* fieldName) const
+    {
+        unsigned geom = DirectiveImageInit(item).geometry();
+        validate_ImageDim(item, val,  fieldName,  geom == Brig::BRIG_GEOMETRY_3D);
+    }
+
+    void validate_fld_Array(Directive item, unsigned val, const char* structName, const char* fieldName) const
+    {
+        unsigned geom = DirectiveImageInit(item).geometry();
+        validate_ImageDim(item, val,  fieldName,  geom == Brig::BRIG_GEOMETRY_1DA || geom == Brig::BRIG_GEOMETRY_2DA);
+    }
+
+    template<class T> void validate_fld_Reserved(T item, unsigned val, const char* structName, const char* fieldName) const
+    {
+        validate(item, val == 0, "Invalid reserved field value", val);
     }
 
     //-------------------------------------------------------------------------
-    //
+    // Low-level BRIG validation (functions used by autogenerated code)
 
-    size_t getMinItemSize(int section, unsigned offset, unsigned itemKind) const
-    {
-        int result = 0;
-        if (section == BRIG_SEC_DIRECTIVES)
-        {
-            result = HSAIL_ASM::size_of_directive(itemKind);
-        }
-        else if (section == BRIG_SEC_CODE)
-        {
-            result = HSAIL_ASM::size_of_inst(itemKind);
-        }
-        else if (section == BRIG_SEC_OPERANDS)
-        {
-            result = HSAIL_ASM::size_of_operand(itemKind);
-        }
-        validate(section, offset, result > 0, "Invalid item kind");
-        return result;
-    }
-
-    bool isTopLevelStatement(Directive d) const
-    {
-        return !HSAIL_ASM::isBodyOnly(d);
-    }
-
-    // Note that images and samplers may be defined as kernarg objects
-    bool isBodyStatement(Directive d) const
-    {
-        return !HSAIL_ASM::isToplevelOnly(d);
-    }
+    void validate_BrigVersion(Directive item, unsigned val, const char* structName, const char* fieldName) const {} // Validated elsewhere
+    void validate_fld_EquivClass(Inst item, unsigned val, const char* structName, const char* fieldName) const {}         // Nothing to do
+    void validate_fld_OffsetHi(Operand item, unsigned val, const char* structName, const char* fieldName) const {}        // Nothing to do
+    void validate_fld_OffsetLo(Operand item, unsigned val, const char* structName, const char* fieldName) const {}        // Nothing to do
+    void validate_fld_InArgCount(Directive item, unsigned val, const char* structName, const char* fieldName) const {}    // Nothing to do
+    void validate_fld_OutArgCount(Directive item, unsigned val, const char* structName, const char* fieldName) const {}   // Validated elsewhere
+    void validate_fld_InstCount(Directive item, unsigned val, const char* structName, const char* fieldName) const {}     // Validated elsewhere
+    void validate_fld_ValueCount(Directive item, unsigned val, const char* structName, const char* fieldName) const {}    // Validated elsewhere
+    void validate_fld_LabelCount(Directive item, unsigned val, const char* structName, const char* fieldName) const {}    // Validated elsewhere
+    void validate_fld_Line(Directive item, unsigned val, const char* structName, const char* fieldName) const {}          // Validated elsewhere
+    void validate_fld_Column(Directive item, unsigned val, const char* structName, const char* fieldName) const {}        // Validated elsewhere
+    void validate_fld_DimLo(Directive item, unsigned val, const char* structName, const char* fieldName) const {}         // Validated elsewhere
+    void validate_fld_DimHi(Directive item, unsigned val, const char* structName, const char* fieldName) const {}         // Validated elsewhere
+    void validate_fld_ByteCount(Operand item, unsigned val, const char* structName, const char* fieldName) const {}       // Validated elsewhere
+    void validate_fld_Bytes(Operand item, uint8_t* val, const char* structName, const char* fieldName) const {}           // Validated elsewhere
+    void validate_fld_RegCount(Operand item, unsigned val, const char* structName, const char* fieldName) const {}        // Validated elsewhere
+    template<class T> void validate_fld_ElementCount(T item, unsigned val, const char* structName, const char* fieldName) const {} // Validated elsewhere
 
     //-------------------------------------------------------------------------
     // Access to Brig sections
 
     string getSectionName(int section) const
     {
-        switch(section) {
+        switch(section)
+        {
         case BRIG_SEC_STRTAB:     return ".strtab";
         case BRIG_SEC_DIRECTIVES: return ".directives";
         case BRIG_SEC_CODE:       return ".code";
@@ -3130,14 +3287,15 @@ private:
     }
 
     template<typename T>
-    T getSectionData(int section, unsigned offset)
+    T getSectionData(int section, unsigned offset) const
     {
         return *(reinterpret_cast<const T*>(getSectionAddr(section) + offset));
     }
 
     const char* getSectionAddr(int section) const
     {
-        switch(section) {
+        switch(section)
+        {
         case BRIG_SEC_STRTAB:     return brig.strings().getData(0);
         case BRIG_SEC_DIRECTIVES: return brig.directives().getData(0);
         case BRIG_SEC_CODE:       return brig.insts().getData(0);
@@ -3151,7 +3309,8 @@ private:
 
     unsigned getSectionSize(int section) const
     {
-        switch(section) {
+        switch(section)
+        {
         case BRIG_SEC_STRTAB:     return (unsigned)brig.strings().size();
         case BRIG_SEC_DIRECTIVES: return (unsigned)brig.directives().size();
         case BRIG_SEC_CODE:       return (unsigned)brig.insts().size();
@@ -3207,6 +3366,16 @@ private:
         if (!cond) throw BrigFormatError(BRIG_SEC_OPERANDS, opr.brigOffset(), msg);
     }
 
+    template<class T>
+    void validate(T item, bool cond, SRef msg, unsigned val) const
+    {
+        if (!cond) {
+            ostringstream s;
+            s << msg << " = " << val;
+            validate(item, cond, s.str());
+        }
+    }
+
     string getErrorPos(int section, unsigned offset) const
     {
         ostringstream s;
@@ -3221,50 +3390,51 @@ private:
     string dumpItem(int section, unsigned offset) const
     {
         ostringstream s;
-        /*
-        if (DumpFormatError)
+
+        if (disasmOnError)
         {
-            s << '\n';
+            Disassembler disasm(brig);
+
             if (section == BRIG_SEC_DIRECTIVES && offset >= BRIG_NUM_BYTES_RESERVED)
             {
                 Directive d(&brig, offset);
-                //F
-                // TBD!!! d.dump(s);
+                s << ": " << disasm.get(d, machineModel);
             }
             else if (section == BRIG_SEC_CODE && offset >= BRIG_NUM_BYTES_RESERVED)
             {
-                Inst i(&brig, offset);
-                //F
-                // TBD!!! i.dump(s);
+                Inst inst(&brig, offset);
+                s << ": " << disasm.get(inst, machineModel);
             }
             else if (section == BRIG_SEC_OPERANDS && offset >= BRIG_NUM_BYTES_RESERVED)
             {
-                Operand o(&brig, offset);
-                //F
-                // TBD!!! o.dump(s);
+                Operand opr(&brig, offset);
+                s << ": " << disasm.get(opr, machineModel);
             }
         }
-        */
         return s.str();
     }
 
     //-------------------------------------------------------------------------
+    // Declaration of auto-generated routines for low-level BRIG validation
 
-    void ValidateInstFields(Inst sect) const;
-    void ValidateOperandFields(Operand sect) const;
-    void ValidateDirectiveFields(Directive sect) const;
+    bool ValidateBrigDirectiveFields(Directive item) const;
+    bool ValidateBrigBlockFields(Directive item) const;
+    bool ValidateBrigInstFields(Inst item) const;
+    bool ValidateBrigOperandFields(Operand item) const;
 
     //-------------------------------------------------------------------------
+    // Helpers
 
-    unsigned getMachineType() const
-    {
-        return (machineModel == Brig::BRIG_MACHINE_SMALL)? Brig::BRIG_TYPE_B32 : Brig::BRIG_TYPE_B64;
-    }
-
-    bool isLargeModel() const { return machineModel == Brig::BRIG_MACHINE_LARGE; }
-
+    bool isLargeModel()                   const { return machineModel == Brig::BRIG_MACHINE_LARGE; }
+    bool isTopLevelStatement(Directive d) const { return !isBodyOnly(d);     }
+    bool isBodyStatement(Directive d)     const { return !isToplevelOnly(d); }
 
 }; // class ValidatorImpl
+
+// ============================================================================
+// Low-level BRIG validation (autogenerated)
+
+#include "HSAILBrigValidation_gen.hpp"
 
 // ============================================================================
 // Public Validator API
@@ -3272,578 +3442,12 @@ private:
 Validator::Validator(BrigContainer &c) { impl = new ValidatorImpl(c); }
 Validator::~Validator()                { delete impl; }
 
-bool   Validator::validate(ValidationMode vMode) const { return impl->validate(vMode); }
+bool   Validator::validate(ValidationMode vMode, bool disasmOnError /*= false*/) const { return impl->validate(vMode, disasmOnError); }
 string Validator::getErrorMsg(istream *is)       const { return impl->getErrorMsg(is); }
 int    Validator::getErrorCode()                 const { return impl->getErrorCode(); }
 
-void Validator::validate(Inst inst, int operandIdx, SRef msg, bool cond)
-{
-    assert(inst);
-
-    if (!cond)
-    {
-
-        int code = BrigFormatError::ERRCODE_INST;
-        if (0 <= operandIdx && operandIdx <= 4 && inst.operand(operandIdx)) {
-            Operand opr = inst.operand(operandIdx);
-            throw BrigFormatError(BRIG_SEC_OPERANDS, opr.brigOffset(), msg, code);
-        } else {
-            throw BrigFormatError(BRIG_SEC_CODE, inst.brigOffset(), msg, code);
-        }
-    }
-}
-
 // ============================================================================
 } // HSAIL_ASM namespace
-
-// ============================================================================
-
-namespace HSAIL_ASM {
-
-    void ValidatorImpl::ValidateDirectiveFields(Directive dir) const
-    {
-        using namespace Brig;
-
-        unsigned kind = dir.brig()->kind;
-
-        switch (kind)
-        {
-        case BRIG_DIRECTIVE_ARG_SCOPE_END:
-            {
-                DirectiveArgScopeEnd d = dir;
-
-                validate_cOffset(dir, d.brig()->code, "DirectiveArgScopeEnd", "code", false, true);
-            }
-            break;
-
-        case BRIG_DIRECTIVE_ARG_SCOPE_START:
-            {
-                DirectiveArgScopeStart d = dir;
-
-                validate_cOffset(dir, d.brig()->code, "DirectiveArgScopeStart", "code", false, true);
-            }
-            break;
-
-        case BRIG_DIRECTIVE_BLOCK_END:
-            {
-                // Nothing to validate
-            }
-            break;
-
-        case BRIG_DIRECTIVE_BLOCK_NUMERIC:
-            {
-                BlockNumeric d = dir;
-
-                validate_DataType(dir, d.brig()->type);
-                validate_Reserved(dir, d.brig()->reserved);
-
-                // This is a variable-size structure
-                // Validation of trailing data is done on next steps
-            }
-            break;
-
-        case BRIG_DIRECTIVE_BLOCK_START:
-            {
-                BlockStart d = dir;
-
-                validate_cOffset(dir, d.brig()->code, "DirectiveBlockStart", "code", false, true);
-                validate_sOffset(dir, d.brig()->name, "DirectiveBlockStart", "name");
-            }
-            break;
-
-        case BRIG_DIRECTIVE_BLOCK_STRING:
-            {
-                BlockString d = dir;
-
-                validate_sOffset(dir, d.brig()->string, "DirectiveBlockString", "string");
-            }
-            break;
-
-        case BRIG_DIRECTIVE_COMMENT:
-            {
-                DirectiveComment d = dir;
-
-                validate_cOffset(dir, d.brig()->code, "DirectiveComment", "code", false, true);
-                validate_sOffset(dir, d.brig()->name, "DirectiveComment", "name");
-            }
-            break;
-
-        case BRIG_DIRECTIVE_CONTROL:
-            {
-                DirectiveControl d = dir;
-
-                validate_cOffset    (dir, d.brig()->code, "DirectiveControl", "code", false, true);
-                validate_ControlType(dir, d.brig()->control);
-                validate_DataType   (dir, d.brig()->type);
-                validate_Reserved   (dir, d.brig()->reserved);
-
-                // This is a variable-size structure
-                // Validation of trailing data is done on next steps
-            }
-            break;
-
-        case BRIG_DIRECTIVE_EXTENSION:
-            {
-                DirectiveExtension d = dir;
-
-                validate_cOffset(dir, d.brig()->code, "DirectiveExtension", "code", false, true);
-                validate_sOffset(dir, d.brig()->name, "DirectiveExtension", "name");
-            }
-            break;
-
-        case BRIG_DIRECTIVE_FBARRIER:
-            {
-                DirectiveFbarrier d = dir;
-
-                validate_cOffset(dir, d.brig()->code, "DirectiveFbarrier", "code", false, true);
-                validate_sOffset(dir, d.brig()->name, "DirectiveFbarrier", "name");
-            }
-            break;
-
-        case BRIG_DIRECTIVE_FILE:
-            {
-                DirectiveFile d = dir;
-
-                validate_cOffset(dir, d.brig()->code,     "DirectiveFile", "code", false, true);
-                validate_sOffset(dir, d.brig()->filename, "DirectiveFile", "filename");
-                validate        (dir, d.brig()->fileid > 0, "Invalid DirectiveFile; file id must be positive");
-            }
-            break;
-
-        case BRIG_DIRECTIVE_FUNCTION:
-        case BRIG_DIRECTIVE_KERNEL:
-            {
-                DirectiveExecutable d = dir;
-                const char* structName = (kind == BRIG_DIRECTIVE_KERNEL)? "DirectiveKernel" : "DirectiveFunction";
-
-                validate_cOffset  (dir, d.brig()->code,                  structName, "code", false, true);
-                validate_sOffset  (dir, d.brig()->name,                  structName, "name");
-                validate_dOffset  (dir, d.brig()->firstInArg,            structName, "firstInArg",            false, true);
-                validate_dOffset  (dir, d.brig()->firstScopedDirective,  structName, "firstScopedDirective",  false, true);
-                validate_dOffset  (dir, d.brig()->nextTopLevelDirective, structName, "nextTopLevelDirective", false, true);
-                validate_ExecMod  (dir, d.brig()->modifier.allBits);
-                validate_Reserved (dir, d.brig()->reserved[0]);
-                validate_Reserved (dir, d.brig()->reserved[1]);
-                validate_Reserved (dir, d.brig()->reserved[2]);
-            }
-            break;
-
-        case BRIG_DIRECTIVE_VARIABLE:
-        case BRIG_DIRECTIVE_SAMPLER:
-        case BRIG_DIRECTIVE_IMAGE:
-            {
-                DirectiveSymbol d = dir;
-
-                const char* structName = (kind == BRIG_DIRECTIVE_VARIABLE)?
-                                             "DirectiveVariable" :
-                                             ((kind == BRIG_DIRECTIVE_SAMPLER)?
-                                                "DirectiveSampler" :
-                                                "DirectiveImage");
-
-                validate_cOffset  (dir, d.brig()->code, structName, "code", false, true);
-                validate_sOffset  (dir, d.brig()->name, structName, "name");
-                validate_dOffset  (dir, d.brig()->init, structName, "init", true);
-                validate_DataType (dir, d.brig()->type);
-                validate_Alignment(dir, d.brig()->align);
-                validate_Segment  (dir, d.brig()->segment);
-                validate_SymMod   (dir, d.brig()->modifier.allBits);
-                validate_Reserved (dir, d.brig()->reserved[0]);
-                validate_Reserved (dir, d.brig()->reserved[1]);
-                validate_Reserved (dir, d.brig()->reserved[2]);
-            }
-            break;
-
-        case BRIG_DIRECTIVE_IMAGE_INIT:
-            {
-                DirectiveImageInit d = dir;
-
-                validate_cOffset    (dir, d.brig()->code, "DirectiveImageInit", "code", false, true);
-                validate            (dir, d.brig()->array > 0, "Invalid image initializer; 'array' value must be positive");
-                validate_ImageOrder (dir, d.brig()->order);
-                validate_ImageFormat(dir, d.brig()->format);
-                validate_Reserved   (dir, d.brig()->reserved);
-            }
-            break;
-
-        case BRIG_DIRECTIVE_LABEL:
-            {
-                DirectiveLabel d = dir;
-
-                validate_cOffset(dir, d.brig()->code, "DirectiveLabel", "code", false, true);
-                validate_sOffset(dir, d.brig()->name, "DirectiveLabel", "name");
-            }
-            break;
-
-        case BRIG_DIRECTIVE_LABEL_TARGETS:
-        case BRIG_DIRECTIVE_LABEL_INIT:
-            {
-                DirectiveLabelList d = dir;
-                const char* structName = (kind == BRIG_DIRECTIVE_LABEL_INIT)? "DirectiveLabelInit" : "DirectiveLabelTargets";
-
-                validate_cOffset (dir, d.brig()->code, structName, "code", false, true);
-                validate_dOffset (dir, d.brig()->label, structName, "label", true);
-                validate_Reserved(dir, d.brig()->reserved);
-
-                // This is a variable-size structure
-                // Validation of d_labels is done on next steps
-            }
-            break;
-
-        case BRIG_DIRECTIVE_LOC:
-            {
-                DirectiveLoc d = dir;
-
-                validate_cOffset(dir, d.brig()->code, "DirectiveLoc", "code", false, true);
-                validate(dir, d.brig()->fileid > 0, "Invalid DirectiveLoc; file id must be positive");
-            }
-            break;
-
-        case BRIG_DIRECTIVE_PRAGMA:
-            {
-                DirectivePragma d = dir;
-
-                validate_cOffset(dir, d.brig()->code, "DirectivePragma", "code", false, true);
-                validate_sOffset(dir, d.brig()->name, "DirectivePragma", "name");
-            }
-            break;
-
-        case BRIG_DIRECTIVE_SAMPLER_INIT:
-            {
-                DirectiveSamplerInit d = dir;
-
-                validate_SamplerModifier(dir, d.brig()->modifier.allBits);
-                validate_SamplerBoundary(dir, d.boundaryU());
-                validate_SamplerBoundary(dir, d.boundaryV());
-                validate_SamplerBoundary(dir, d.boundaryW());
-            }
-            break;
-
-        case BRIG_DIRECTIVE_SCOPE: //F Looks like this value is unused and should be deleted
-            assert(false);
-            break;
-
-        case BRIG_DIRECTIVE_SIGNATURE:
-            {
-                DirectiveSignature d = dir;
-
-                validate_cOffset(dir, d.brig()->code, "DirectiveSignature", "code", false, true);
-                validate_sOffset(dir, d.brig()->name, "DirectiveSignature", "name");
-
-                // This is a variable-size structure
-                // Validation of types is done on next steps
-            }
-            break;
-
-        case BRIG_DIRECTIVE_VARIABLE_INIT:
-            {
-                DirectiveVariableInit d = dir;
-
-                validate_cOffset (dir, d.brig()->code, "DirectiveVariableInit", "code", false, true);
-                validate_sOffset (dir, d.brig()->data, "DirectiveVariableInit", "data");
-                validate_DataType(dir, d.brig()->type);
-                validate_Reserved(dir, d.brig()->reserved);
-
-                // This is a variable-size structure
-                // Validation of data is done on next steps
-            }
-            break;
-
-        case BRIG_DIRECTIVE_VERSION:
-            {
-                DirectiveVersion d = dir;
-
-                validate_cOffset (dir, d.brig()->code, "DirectiveVersion", "code", false, true);
-                validate_Machine (dir, d.brig()->machineModel);
-                validate_Profile (dir, d.brig()->profile);
-                validate_Reserved(dir, d.brig()->reserved);
-
-                // Version numbers are validated separately
-            }
-            break;
-
-        default:
-            validate(dir, false, "Invalid directive kind");
-
-        } // switch
-
-    } // ValidateDirectiveFields
-
-    void ValidatorImpl::ValidateOperandFields(Operand opr) const
-    {
-        using namespace Brig;
-
-        switch (opr.brig()->kind)
-        {
-
-        case BRIG_OPERAND_IMMED:
-            {
-                OperandImmed o = opr;
-
-                validate_DataType(opr, o.brig()->type);
-
-                // This is a variable-size structure
-                // Validation of data is done on next steps
-            }
-            break;
-
-        case BRIG_OPERAND_WAVESIZE:
-            {
-                OperandWavesize o = opr;
-
-                validate_DataType(opr, o.brig()->type);
-                validate_Reserved(opr, o.brig()->reserved);
-            }
-            break;
-
-        case BRIG_OPERAND_REG:
-            {
-                OperandReg o = opr;
-
-                validate_sOffset (opr, o.brig()->reg, "OperandReg", "reg");
-                validate_DataType(opr, o.brig()->type);
-                validate_Reserved(opr, o.brig()->reserved);
-            }
-            break;
-
-        case BRIG_OPERAND_REG_VECTOR:
-            {
-                OperandRegVector o = opr;
-
-                validate_DataType(opr, o.brig()->type);
-
-                // This is a variable-size structure
-                // Validation of data is done on next steps
-            }
-            break;
-
-        case BRIG_OPERAND_ADDRESS:
-            {
-                OperandAddress o = opr;
-
-                validate_dOffset (opr, o.brig()->symbol, "OperandAddress", "symbol", true);
-                validate_sOffset (opr, o.brig()->reg,    "OperandAddress", "reg",    true);
-                validate_DataType(opr, o.brig()->type);
-                validate_Reserved(opr, o.brig()->reserved);
-            }
-            break;
-
-case BRIG_OPERAND_ARGUMENT_REF: assert(false); break;
-
-        case BRIG_OPERAND_LABEL_REF:      { OperandRef o = opr; validate_dOffset(opr, o.brig()->ref, "OperandLabelRef",     "ref"); } break;
-        case BRIG_OPERAND_FUNCTION_REF:   { OperandRef o = opr; validate_dOffset(opr, o.brig()->ref, "OperandFunctionRef",  "ref"); } break;
-        case BRIG_OPERAND_SIGNATURE_REF:  { OperandRef o = opr; validate_dOffset(opr, o.brig()->ref, "OperandSignatureRef", "ref"); } break;
-        case BRIG_OPERAND_FBARRIER_REF:   { OperandRef o = opr; validate_dOffset(opr, o.brig()->ref, "OperandFbarrierRef",  "ref"); } break;
-
-
-        case BRIG_OPERAND_ARGUMENT_LIST:
-        case BRIG_OPERAND_FUNCTION_LIST:
-            {
-                OperandList o = opr;
-
-                validate_Reserved(opr, o.brig()->reserved);
-
-                // This is a variable-size structure
-                // Validation of data is done on next steps
-            }
-            break;
-
-        default:
-            validate(opr, false, "Invalid operand kind");
-        } // switch
-
-    } // ValidateOperandFields
-
-    void ValidatorImpl::ValidateInstFields(Inst inst) const
-    {
-        using namespace Brig;
-
-        for (int i = 0; i < 5; ++i)
-        {
-            validate_oOffset(inst, inst.brig()->operands[i], "Inst", "operands[*]", true);
-        }
-
-        switch (inst.brig()->kind)
-        {
-        case BRIG_INST_BASIC:
-            {
-                InstBasic it = inst;
-
-                validate_Opcode  (inst, it.brig()->opcode);
-                validate_DataType(inst, it.brig()->type);
-            }
-            break;
-
-        case BRIG_INST_ATOMIC:
-            {
-                InstAtomic it = inst;
-
-                validate_Opcode  (inst, it.brig()->opcode);
-                validate_DataType(inst, it.brig()->type);
-                validate_Segment (inst, it.brig()->segment);
-                validate_MemSem  (inst, it.brig()->memorySemantic);
-                validate_AtomicOp(inst, it.brig()->atomicOperation);
-                validate_Reserved(inst, it.brig()->reserved);
-            }
-            break;
-
-        case BRIG_INST_ATOMIC_IMAGE:
-            {
-                InstAtomicImage it = inst;
-
-                validate_Opcode  (inst, it.brig()->opcode);
-                validate_DataType(inst, it.brig()->type);
-                validate_DataType(inst, it.brig()->imageType);
-                validate_DataType(inst, it.brig()->coordType);
-                validate_Geom    (inst, it.brig()->geometry);
-                validate_AtomicOp(inst, it.brig()->atomicOperation);
-                validate_Reserved(inst, it.brig()->reserved);
-            }
-            break;
-
-        case BRIG_INST_CVT:
-            {
-                InstCvt it = inst;
-
-                validate_Opcode  (inst, it.brig()->opcode);
-                validate_DataType(inst, it.brig()->type);
-                validate_DataType(inst, it.brig()->sourceType);
-                validate_AluMod  (inst, it.brig()->modifier.allBits);
-            }
-            break;
-
-        case BRIG_INST_BAR:
-            {
-                InstBar it = inst;
-
-                validate_Opcode  (inst, it.brig()->opcode);
-                validate_DataType(inst, it.brig()->type);
-                validate_Fence   (inst, it.brig()->memoryFence);
-                validate_Width   (inst, it.brig()->width);
-                validate_Reserved(inst, it.brig()->reserved);
-            }
-            break;
-
-        case BRIG_INST_BR:
-            {
-                InstBr it = inst;
-
-                validate_Opcode  (inst, it.brig()->opcode);
-                validate_DataType(inst, it.brig()->type);
-                validate_AluMod  (inst, it.brig()->modifier.allBits);
-                validate_Width   (inst, it.brig()->width);
-                validate_Reserved(inst, it.brig()->reserved);
-            }
-            break;
-
-        case BRIG_INST_CMP:
-            {
-                InstCmp it = inst;
-
-                validate_Opcode  (inst, it.brig()->opcode);
-                validate_DataType(inst, it.brig()->type);
-                validate_DataType(inst, it.brig()->sourceType);
-                validate_AluMod  (inst, it.brig()->modifier.allBits);
-                validate_CmpOp   (inst, it.brig()->compare);
-                validate_Packing (inst, it.brig()->pack);
-                validate_Reserved(inst, it.brig()->reserved);
-            }
-            break;
-
-        case BRIG_INST_FBAR:
-            {
-                InstFbar it = inst;
-
-                validate_Opcode  (inst, it.brig()->opcode);
-                validate_DataType(inst, it.brig()->type);
-                validate_Fence   (inst, it.brig()->memoryFence);
-                validate_Width   (inst, it.brig()->width);
-                validate_Reserved(inst, it.brig()->reserved);
-            }
-            break;
-
-        case BRIG_INST_IMAGE:
-            {
-                InstImage it = inst;
-
-                validate_Opcode  (inst, it.brig()->opcode);
-                validate_DataType(inst, it.brig()->type);
-                validate_DataType(inst, it.brig()->imageType);
-                validate_DataType(inst, it.brig()->coordType);
-                validate_Geom    (inst, it.brig()->geometry);
-                validate_Reserved(inst, it.brig()->reserved[0]);
-                validate_Reserved(inst, it.brig()->reserved[1]);
-                validate_Reserved(inst, it.brig()->reserved[2]);
-            }
-            break;
-
-        case BRIG_INST_MEM:
-            {
-                InstMem it = inst;
-
-                validate_Opcode  (inst, it.brig()->opcode);
-                validate_DataType(inst, it.brig()->type);
-                validate_Segment (inst, it.brig()->segment);
-                validate_MemMod  (inst, it.brig()->modifier.allBits);
-                validate_Width   (inst, it.brig()->width);
-            }
-            break;
-
-        case BRIG_INST_ADDR:
-            {
-                InstAddr it = inst;
-
-                validate_Opcode  (inst, it.brig()->opcode);
-                validate_DataType(inst, it.brig()->type);
-                validate_Segment (inst, it.brig()->segment);
-                validate_Reserved(inst, it.brig()->reserved[0]);
-                validate_Reserved(inst, it.brig()->reserved[1]);
-                validate_Reserved(inst, it.brig()->reserved[2]);
-            }
-            break;
-
-        case BRIG_INST_MOD:
-            {
-                InstMod it = inst;
-
-                validate_Opcode  (inst, it.brig()->opcode);
-                validate_DataType(inst, it.brig()->type);
-                validate_AluMod  (inst, it.brig()->modifier.allBits);
-                validate_Packing (inst, it.brig()->pack);
-                validate_Reserved(inst, it.brig()->reserved);
-            }
-            break;
-
-        case BRIG_INST_SEG:
-            {
-                InstSeg it = inst;
-
-                validate_Opcode  (inst, it.brig()->opcode);
-                validate_DataType(inst, it.brig()->type);
-                validate_DataType(inst, it.brig()->sourceType);
-                validate_Segment (inst, it.brig()->segment);
-                validate_Reserved(inst, it.brig()->reserved);
-            }
-            break;
-
-        case BRIG_INST_SOURCE_TYPE:
-            {
-                InstSourceType it = inst;
-
-                validate_Opcode  (inst, it.brig()->opcode);
-                validate_DataType(inst, it.brig()->type);
-                validate_DataType(inst, it.brig()->sourceType);
-                validate_Reserved(inst, it.brig()->reserved);
-            }
-            break;
-
-        default:
-            validate(inst, false, "Invalid instruction kind");
-        } // switch
-
-    } // ValidateInstFields
-
-} // HSAIL_ASM namespace
-
 
 //F EXTENSIONS:
 //F - BrigImageFormat: Values 16 through 64 are available for extensions
@@ -3858,16 +3462,20 @@ case BRIG_OPERAND_ARGUMENT_REF: assert(false); break;
 
 //F TODO
 //F validate new flags such as isDecl (their correlation with other props) ::: create random BRIG tests on all combinations of flags
+//F Improve errors reporting for "Invalid reference to label defined in another scope"
 
 //F POSTPONED FEATURES
 //F The s, d, and q registers in HSAIL share a single pool of resources.
 //F add support of querysamplerboundary (added in April)
 
+//F TEMPORARILY DISABLED FEATURES
+//F - identifiers must not start with "__hsa" (currently, this check is disabled)
+//F - addresses of 32-bit segments must have b32 type and 's' register, if any (currently, addresses may have both b32 and b64 type; both 's' and 'd' registers and allowed)
+//F - images and samplers must be passed to operations in 'd' registers (currently, addresses are allowed as well)
 
 //F MINOR PENDING FEATURES
 //F - nop
 //F - The s, d, and q registers in HSAIL share a single pool of resources.
-//F - Section  Header: The first entry in every section must be BrigSectionHeader, which consists of a 32-bit word that is the byte size of the section.
 
 //F MAJOR PENDING FEATURES
 //F - constants conversions and validation (4.10.4 How Text Format Constants Are Converted to Bit String Constants)

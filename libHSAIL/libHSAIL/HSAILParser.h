@@ -61,9 +61,10 @@ public:
     void parseSource();
 
 private:
-    Scanner&   m_scanner;
-    Brigantine m_bw;
-    bool       m_gcnEnabled;
+    Scanner&    m_scanner;
+    Brigantine  m_bw;
+    bool        m_gcnEnabled;   
+    std::string m_srcFileName;
 
     Parser& operator=(const Parser&);
 
@@ -87,10 +88,11 @@ private:
     int  parseCodeBlock(); // returns the number of instructions inside
     int  parseBodyStatement(); // returns the number of instructions inside
     void parseLabel();
+    void parseLabelTargets();
     Inst parseInst();
 
-    DirectiveSymbol parseDecl(bool isArg, bool isLocal);
-    DirectiveSymbol parseDecl(bool isArg, bool isLocal,const struct DeclPrefix& declPfx);
+    DirectiveVariable parseDecl(bool isArg, bool isLocal);
+    DirectiveVariable parseDecl(bool isArg, bool isLocal,const struct DeclPrefix& declPfx);
     struct DeclPrefix parseDeclPrefix();
 
     Directive parseVariableInitializer(Brig::BrigType16_t type, bool asArray, unsigned expectedSize);
@@ -106,16 +108,16 @@ private:
     void parseExtension();
     void parseFileDecl();
     void parseControl();
-
+   
     unsigned parseValueList(Brig::BrigType16_t type, class ArbitraryData& data, unsigned maxValues=0);
 
     void parseBlock();
-
+    
     typedef void (Parser::*OperandParser)(Inst);
     static OperandParser getOperandParser(Brig::BrigOpcode16_t opcode);
 
     Inst parseInstLdSt();
-    Inst parseInstCombineExpand(unsigned operandIdx);
+    Inst parseInstCombineExpand(unsigned operandIdx); 
     Inst parseInstImage();
 
     int  parseArgScope();
@@ -151,9 +153,10 @@ private:
     Operand parseActualParamList();
 
     Operand parseObjectOperand();
-    void parseAddress(SRef& reg, int32_t& offset);
+    void parseAddress(SRef& reg, int64_t& offset);
 
-    unsigned parseLabelList(LabelList list, unsigned expectedSize);
+    template <typename List>
+    unsigned parseLabelList(List list, unsigned expectedSize);
 
     void storeComments(Inst before=Inst());
 };
