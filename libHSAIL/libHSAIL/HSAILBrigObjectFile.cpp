@@ -170,11 +170,11 @@ public:
 public:
     int readContainer(BrigContainer &c, ReadAdapter *s) {
         if (s->pread((char*)&elfHeader, sizeof(elfHeader), 0)) {
-            s->errs << " reading ELF header";
+            s->errs << " reading ELF header" << std::endl;
             return 1;
         }
         if (!elfHeader.checkMagic()) {
-            s->errs << "Invalid ELF header";
+            s->errs << "Invalid ELF header" << std::endl;
             return 1;
         }
         if (fmt == FILE_FORMAT_AUTO) {
@@ -186,7 +186,8 @@ public:
                 s->errs << "Unable to detect format with type=" 
                           << elfHeader.e_type
                           << ", machine = "
-                          << elfHeader.e_machine;
+                          << elfHeader.e_machine << std::endl;
+                return 1;  
             }
         }
         sectionHeaders.resize(elfHeader.e_shnum);
@@ -194,7 +195,7 @@ public:
             if (s->pread((char*)&sectionHeaders[i], sizeof(Shdr),
                               elfHeader.e_shoff + i * elfHeader.e_shentsize)) 
             {
-                s->errs << " reading section headers";
+                s->errs << " reading section headers" << std::endl;
                 return 1;
             }
         };
@@ -252,19 +253,19 @@ private:
 
     int readSection(std::vector<char> &dst, ReadAdapter *s, unsigned index) {
         if (index >= sectionHeaders.size()) {
-            s->errs << "Section index " << index << " out of bounds";
+            s->errs << "Section index " << index << " out of bounds" << std::endl;
             return 1;
         }
         Shdr &shdr = sectionHeaders[index];
         if (shdr.sh_size > (std::numeric_limits<unsigned>::max)()) {
-            s->errs << "Section size more than 4GB is not supported";
+            s->errs << "Section size more than 4GB is not supported" << std::endl;
             return 1;
         }
         if (preadVec(s, dst, static_cast<unsigned>(shdr.sh_size), shdr.sh_offset))
         {
             const char* name = sectionName(index);
             s->errs << " reading section ";
-            if (name) { s->errs << name; } else { s->errs << index; } 
+            if (name) { s->errs << name << std::endl; } else { s->errs << index << std::endl; } 
             return 1;
         }
         return 0;
@@ -434,7 +435,7 @@ struct FileAdapter : public ReadWriteAdapter {
     {
     }
     static void printErr(std::ostream& s) {
-        s << "Error " << errno << " (" << strerror(errno) << ")";
+        s << "Error " << errno << " (" << strerror(errno) << ")" << std::endl;
     }
     int open(const char* filename, bool forWriting) {
         if (forWriting) {
@@ -444,7 +445,7 @@ struct FileAdapter : public ReadWriteAdapter {
         }
         if (fd < 0) {
             printErr(errs);
-            errs << " opening \"" << filename << "\"";
+            errs << " opening \"" << filename << "\"" << std::endl;
             return 1;
         }
         return 0;
@@ -462,7 +463,7 @@ struct FileAdapter : public ReadWriteAdapter {
         int res = ::write(fd, data, (unsigned)numBytes);
         if (check1(res)) return 1;
         if (res != (int)numBytes) {
-            errs << "Wrote " << res << " bytes instead of " << numBytes;
+            errs << "Wrote " << res << " bytes instead of " << numBytes << std::endl;
             return 1;
         }
         return 0;
@@ -530,7 +531,7 @@ struct MemoryAdapter : public ReadWriteAdapter {
     }
     virtual int write(const char* data, size_t numBytes) const {
         if (pos + numBytes > bufSize) {
-            errs << "Writing beyond the end of the buffer";
+            errs << "Writing beyond the end of the buffer" << std::endl;
             return 1;
         }
         memcpy(buf + pos, data, numBytes);
@@ -601,22 +602,23 @@ int BrigIO::load(BrigContainer &dst,
 {
     unsigned char ident[16];
     if (!(src.pread((char*)ident, 16, 0))) {
-			switch(ident[EI_CLASS]) {
-			case ELFCLASS32: {
-					BrigIOImpl<Elf32Policy> impl(fmt);
-					return impl.readContainer(dst, &src);
-					}
-			case ELFCLASS64: {
-					BrigIOImpl<Elf64Policy> impl(fmt);
-					return impl.readContainer(dst, &src);
-					}
-			default:
-					src.errs << "Invalid ELFCLASS";
-					return 1;
-			}
-		} else {
-			return 1;
-		}
+      switch(ident[EI_CLASS]) {
+      case ELFCLASS32: {
+          BrigIOImpl<Elf32Policy> impl(fmt);
+          return impl.readContainer(dst, &src);
+          }
+      case ELFCLASS64: {
+          BrigIOImpl<Elf64Policy> impl(fmt);
+          return impl.readContainer(dst, &src);
+          }
+      default:
+          src.errs << "Invalid ELFCLASS" << std::endl;
+          return 1;
+      }
+    } else {
+      src.errs << std::endl;
+      return 1;
+    }
 }
 
 int BrigIO::save(BrigContainer &src, 
