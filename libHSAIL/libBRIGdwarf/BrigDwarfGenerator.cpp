@@ -1328,8 +1328,7 @@ void BrigDwarfGenerator_impl::createDwarfElfSections()
                 }
                 else
                 {
-                    /* libDWARF must set default type of relocations */
-                    assert(relType == __R_HSA_DWARF_32);
+                    rr->r_info = ELF32_R_INFO(relSym, __R_HSA_DWARF_32);
                 }
 
             }
