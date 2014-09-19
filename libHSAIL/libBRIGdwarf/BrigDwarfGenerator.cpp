@@ -754,10 +754,10 @@ void BrigDwarfGenerator_impl::generateDwarfForBrigKernelFunction( HSAIL_ASM::Dir
     {
         HSAIL_ASM::Inst instr = cur;
         if (!instr) continue;
-        ++instrIndex;
         if (instrIndex == 0) {
           startPC = instr.brigOffset();
         }
+        ++instrIndex;
         lastInstr = instr;
         const HSAIL_ASM::SourceInfo *pSrcInfo( instr.container()->sourceInfo( instr ) );
         if (!pSrcInfo) continue;
