@@ -350,7 +350,7 @@ public:
         if (m_offsets.empty()) {
             return SRef();
         } else {
-            const char* dataPtr = (char*)&m_offsets[0];
+            const char* dataPtr = (const char*)&m_offsets[0];
             return SRef(dataPtr, dataPtr + sizeof(unsigned) * m_offsets.size());
         }
     }
@@ -419,7 +419,7 @@ public:
       assert((length & 3) == 0);
       //assert(index*4 < length);
       if (index * 4 < length) {
-        Offset offset = *((unsigned*)(theData.begin + index*4));
+        Offset offset = *((unsigned*)const_cast<char*>(theData.begin + index*4));
         return Item(itemSection, offset);
       } else {
         return Item();

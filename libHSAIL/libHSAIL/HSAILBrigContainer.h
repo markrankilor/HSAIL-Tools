@@ -203,7 +203,7 @@ public:
     const T* getData(Offset offset) const { return reinterpret_cast<const T*>(getData(offset)); }
     /// @}
 
-    char* getData(Offset offset) { return (char*)m_data + offset; }
+    char* getData(Offset offset) { return (char*)const_cast<Brig::BrigSectionHeader*>(m_data) + offset; }
     const char* getData(Offset offset) const { return (const char*)m_data + offset; }
 
     /// insert uninitialized data into the section.
