@@ -92,7 +92,8 @@ HSAIL_C_API brig_container_t brig_container_create_copy(
   api->container.strings().setData(data_bytes);
   api->container.code().setData(code_bytes);
   api->container.operands().setData(operand_bytes);
-  api->container.debugInfo().setData(debug_bytes);
+  if (debug_bytes)
+	  api->container.debugInfo().setData(debug_bytes);
   return (brig_container_t)api;
 }
 
