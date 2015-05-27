@@ -1,7 +1,7 @@
 // University of Illinois/NCSA
 // Open Source License
 //
-// Copyright (c) 2013, Advanced Micro Devices, Inc.
+// Copyright (c) 2013-2015, Advanced Micro Devices, Inc.
 // All rights reserved.
 //
 // Developed by:
@@ -38,39 +38,46 @@
 // LIABILITY, WHETHER IN AN ACTION OF CONTRACT, TORT OR OTHERWISE, ARISING FROM,
 // OUT OF OR IN CONNECTION WITH THE SOFTWARE OR THE USE OR OTHER DEALINGS WITH THE
 // SOFTWARE.
+#ifndef __SECTION_HEADER_H__
+#define __SECTION_HEADER_H__
 
-static const char* getBrigPropName(unsigned prop)
+#include <vector>
+
+namespace BrigDebug
 {
-    switch(prop)
-    {
-    case PROP_ALIGN: return "align";
-    case PROP_ATOMICOPERATION: return "atomicOperation";
-    case PROP_COMPARE: return "compare";
-    case PROP_COORDTYPE: return "coordType";
-    case PROP_EQUIVCLASS: return "equivClass";
-    case PROP_FTZ: return "ftz";
-    case PROP_GEOMETRY: return "geometry";
-    case PROP_GLOBALSEGMENTMEMORYSCOPE: return "globalSegmentMemoryScope";
-    case PROP_GROUPSEGMENTMEMORYSCOPE: return "groupSegmentMemoryScope";
-    case PROP_IMAGEQUERY: return "imageQuery";
-    case PROP_IMAGESEGMENTMEMORYSCOPE: return "imageSegmentMemoryScope";
-    case PROP_IMAGETYPE: return "imageType";
-    case PROP_ISCONST: return "isConst";
-    case PROP_ISNONULL: return "isNoNull";
-    case PROP_MEMORYORDER: return "memoryOrder";
-    case PROP_MEMORYSCOPE: return "memoryScope";
-    case PROP_OPCODE: return "opcode";
-    case PROP_PACK: return "pack";
-    case PROP_ROUND: return "round";
-    case PROP_SAMPLERQUERY: return "samplerQuery";
-    case PROP_SEGMENT: return "segment";
-    case PROP_SIGNALOPERATION: return "signalOperation";
-    case PROP_SIGNALTYPE: return "signalType";
-    case PROP_SOURCETYPE: return "sourceType";
-    case PROP_TYPE: return "type";
-    case PROP_WIDTH: return "width";
-    default:
-        assert(false);
-        return "";
-    }
-}
+
+class SectionHeaderTable
+{
+public:
+	SectionHeaderTable()
+	{
+		m_data.push_back( '\0' );
+	}
+
+	virtual ~SectionHeaderTable() {}
+
+	size_t addHeaderName( const std::string & headerName )
+	{
+		size_t newOffset = m_data.size();
+		m_data.insert( m_data.end(), headerName.begin(), headerName.end() );
+		m_data.push_back( '\0' );
+		return newOffset;
+	}
+
+	const char * rawHeaderData()
+	{
+		return &m_data[0];
+	}
+
+	size_t rawHeaderSize()
+	{
+		return m_data.size();
+	}
+
+private:
+	std::vector<char> m_data;
+};
+
+} // end namespace BrigDebug
+
+#endif // #ifndef __SECTION_HEADER_H__

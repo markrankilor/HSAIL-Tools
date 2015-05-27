@@ -1,7 +1,7 @@
 // University of Illinois/NCSA
 // Open Source License
 //
-// Copyright (c) 2013, Advanced Micro Devices, Inc.
+// Copyright (c) 2013-2015, Advanced Micro Devices, Inc.
 // All rights reserved.
 //
 // Developed by:
@@ -39,6 +39,7 @@
 // OUT OF OR IN CONNECTION WITH THE SOFTWARE OR THE USE OR OTHER DEALINGS WITH THE
 // SOFTWARE.
 #include "HSAILBrigantine.h"
+#include "HSAILUtilities.h"
 
 #include <strstream>
 
@@ -53,14 +54,14 @@ unsigned getRegisterType(const SRef& name)
     if (name.begin[0]!=0) {
         assert(name.length() > 1);
         switch(name.begin[1]) {
-        case 'c' : return Brig::BRIG_TYPE_B1;
-        case 's' : return Brig::BRIG_TYPE_B32;
-        case 'q' : return Brig::BRIG_TYPE_B128;
+        case 'c' : return BRIG_TYPE_B1;
+        case 's' : return BRIG_TYPE_B32;
+        case 'q' : return BRIG_TYPE_B128;
         case 'd' :
         default:;
         }
     }
-    return Brig::BRIG_TYPE_B64;
+    return BRIG_TYPE_B64;
 }
 
 
@@ -98,24 +99,28 @@ void Brigantine::endProgram()
     m_container.patchDecl2Defs();
 }
 
-DirectiveVersion Brigantine::version(
-    Brig::BrigVersion32_t major,
-    Brig::BrigVersion32_t minor,
-    Brig::BrigMachineModel8_t machineModel,
-    Brig::BrigProfile8_t profile,
+DirectiveModule Brigantine::module(
+    const SRef& name,
+    BrigVersion32_t major,
+    BrigVersion32_t minor,
+    BrigMachineModel8_t machineModel,
+    BrigProfile8_t profile,
+    BrigRound8_t defaultRound,
     const SourceInfo* srcInfo)
 {
-    DirectiveVersion version = m_container.append<DirectiveVersion>();
-    annotate(version,srcInfo);
-    version.hsailMajor() = major;
-    version.hsailMinor() = minor;
-    version.brigMajor()  = Brig::BRIG_VERSION_BRIG_MAJOR;
-    version.brigMinor()  = Brig::BRIG_VERSION_BRIG_MINOR;
-    version.machineModel() = machineModel;
-    version.profile() = profile;
+    DirectiveModule module = m_container.append<DirectiveModule>();
+    annotate(module,srcInfo);
+    module.hsailMajor() = major;
+    module.hsailMinor() = minor;
+    module.machineModel() = machineModel;
+    module.profile() = profile;
+    module.name() = name;
+    module.defaultFloatRound() = defaultRound;
     m_profile = profile;
     m_machine = machineModel;
-    return version;
+
+    addSymbolToGlobalScope(module);
+    return module;
 }
 
 DirectiveFunction Brigantine::declFunc(const SRef& name, const SourceInfo* srcInfo)
@@ -149,7 +154,6 @@ DirectiveExecutable Brigantine::declFuncCommon(DirectiveExecutable func,const SR
 {
     annotate(func,srcInfo);
     func.name() = name;
-    func.codeBlockEntryCount() = 0;
     func.nextModuleEntry() = m_container.code().end();
     func.firstCodeBlockEntry() = m_container.code().end();
     func.firstInArg() = m_container.code().end();
@@ -163,10 +167,9 @@ DirectiveExecutable Brigantine::declFuncCommon(DirectiveExecutable func,const SR
 void Brigantine::addOutputParameter(DirectiveVariable sym)
 {
     assert(m_func && sym);
-    sym.linkage() = Brig::BRIG_LINKAGE_NONE;
-    sym.allocation() = Brig::BRIG_ALLOCATION_NONE;
+    sym.linkage() = BRIG_LINKAGE_NONE;
+    sym.allocation() = BRIG_ALLOCATION_AUTOMATIC;
     sym.modifier().isDefinition() = 1;
-    if (sym.modifier().isArray() && sym.dim() == 0) sym.modifier().isFlexArray() = true;
 
     DirectiveExecutable func = m_func;
     assert(func);
@@ -179,10 +182,9 @@ void Brigantine::addOutputParameter(DirectiveVariable sym)
 void Brigantine::addInputParameter(DirectiveVariable sym)
 {
     assert(m_func && sym);
-    sym.linkage() = Brig::BRIG_LINKAGE_NONE;
-    sym.allocation() = Brig::BRIG_ALLOCATION_NONE;
+    sym.linkage() = BRIG_LINKAGE_NONE;
+    sym.allocation() = BRIG_ALLOCATION_AUTOMATIC;
     sym.modifier().isDefinition() = 1;
-    if (sym.modifier().isArray() && sym.dim() == 0) sym.modifier().isFlexArray() = true;
 
     DirectiveExecutable func = m_func;
     func.inArgCount() = func.inArgCount() + 1;
@@ -200,19 +202,21 @@ void Brigantine::startBody()
 
     DirectiveExecutable func = m_func;
     if (func && func.outArgCount() > 0) {
-        DirectiveVariable sym = func.next();
+        Code cur = func.next();
         for(uint32_t i=func.outArgCount(); i>0; --i) {
+            DirectiveVariable sym = cur;
             assert(sym);
             addSymbolToFunctionScope(sym);
-            sym = sym.next();
+            cur = cur.next();
         }
     }
     if (m_func.inArgCount() > 0) {
-        DirectiveVariable sym = m_func.firstInArg();
+        Code cur = m_func.firstInArg();
         for(uint32_t i=m_func.inArgCount(); i>0; --i) {
+            DirectiveVariable sym = cur;
             assert(sym);
             addSymbolToFunctionScope(sym);
-            sym = sym.next();
+            cur = cur.next();
         }
     }
 }
@@ -225,10 +229,6 @@ bool Brigantine::endBody()
     }
 
     m_func.nextModuleEntry() = m_container.code().end();
-
-    unsigned cnt = 0;
-    for (Code i = m_func.firstCodeBlockEntry(); i != m_func.nextModuleEntry(); i = i.next()) ++cnt;
-    m_func.codeBlockEntryCount() = cnt;
 
     m_funcScope.reset();
     DirectiveExecutable fx = m_func;
@@ -310,15 +310,26 @@ DirectiveVariable Brigantine::addSymbol(DirectiveVariable sym)
 
 DirectiveVariable Brigantine::addVariable(
     const SRef& name,
-    Brig::BrigSegment8_t segment,
-    unsigned dType,
+    BrigSegment8_t segment,
+    unsigned scalarType,
     const SourceInfo* srcInfo)
 {
+    assert(!isArrayType(scalarType)); //NB: note that type affects alignment (see below)
+
     DirectiveVariable sym = m_container.append<DirectiveVariable>();
     annotate(sym,srcInfo);
     sym.name() = name;
     sym.segment() = segment;
-    sym.type() = dType;
+    sym.type() = scalarType;
+    sym.align() = getNaturalAlignment(scalarType);
+    sym.modifier().isDefinition() = true;
+    sym.linkage() = segment == BRIG_SEGMENT_ARG ? BRIG_LINKAGE_ARG :
+                            m_funcScope.get() != NULL ? BRIG_LINKAGE_FUNCTION :
+                                                        BRIG_LINKAGE_MODULE;
+
+    sym.allocation() = segment == BRIG_SEGMENT_GLOBAL ?   BRIG_ALLOCATION_PROGRAM :
+                       segment == BRIG_SEGMENT_READONLY ? BRIG_ALLOCATION_AGENT :
+                                                                BRIG_ALLOCATION_AUTOMATIC;
     addSymbol(sym);
     return sym;
 }
@@ -326,30 +337,32 @@ DirectiveVariable Brigantine::addVariable(
 DirectiveVariable Brigantine::addArrayVariable(
     const SRef& name,
     uint64_t size,
-    Brig::BrigSegment8_t segment,
-    unsigned dType,
+    BrigSegment8_t segment,
+    unsigned elementType,
     const SourceInfo* srcInfo)
 {
-    DirectiveVariable sym = addVariable(name,segment,dType,srcInfo);
-    sym.modifier().isArray() = true;
+    assert(!isArrayType(elementType));
+
+    DirectiveVariable sym = addVariable(name,segment,elementType,srcInfo);
+    sym.type() = elementType2arrayType(sym.type());
     sym.dim() = size;
     return sym;
 }
 
 DirectiveVariable Brigantine::addImage(
     const SRef& name,
-    Brig::BrigSegment8_t segment,
+    BrigSegment8_t segment,
     const SourceInfo* srcInfo)
 {
-    return addVariable(name,segment,Brig::BRIG_TYPE_RWIMG,srcInfo);
+    return addVariable(name,segment,BRIG_TYPE_RWIMG,srcInfo);
 }
 
 DirectiveVariable Brigantine::addSampler(
     const SRef& name,
-    Brig::BrigSegment8_t segment,
+    BrigSegment8_t segment,
     const SourceInfo* srcInfo)
 {
-    return addVariable(name,segment,Brig::BRIG_TYPE_SAMP,srcInfo);
+    return addVariable(name,segment,BRIG_TYPE_SAMP,srcInfo);
 }
 
 DirectiveFbarrier Brigantine::addFbarrier(const SRef& name,const SourceInfo* srcInfo) {
@@ -374,6 +387,7 @@ DirectiveFbarrier Brigantine::addFbarrier(const SRef& name,const SourceInfo* src
 
 DirectiveLabel Brigantine::addLabelInternal(const SRef& name,const SourceInfo* srcInfo)
 {
+    assert(m_funcScope.get());
     DirectiveLabel lbl = m_funcScope->get<DirectiveLabel>(name);
     if (lbl) {
         brigWriteError("Duplicate label declaration",srcInfo);
@@ -403,7 +417,7 @@ DirectiveComment Brigantine::addComment(const char *comment,const SourceInfo* sr
     return cmt;
 }
 
-DirectiveLabel Brigantine::addExtension(const char *name,const SourceInfo* srcInfo)
+DirectiveExtension Brigantine::addExtension(const char *name,const SourceInfo* srcInfo)
 {
     DirectiveExtension ext = m_container.append<DirectiveExtension>();
     annotate(ext,srcInfo);
@@ -427,21 +441,21 @@ OperandArgumentList Brigantine::createArgList(const SourceInfo* srcInfo)
 }
 */
 
-OperandData Brigantine::createWidthOperand(const Optional<uint32_t>& width,const SourceInfo* srcInfo) {
+OperandConstantBytes Brigantine::createWidthOperand(const Optional<uint32_t>& width,const SourceInfo* srcInfo) {
     uint32_t bits = width.value(0);
-    return createImmed(SRef::array(&bits), srcInfo);
+    return createImmed(SRef::array(&bits), BRIG_TYPE_U64, srcInfo);
 }
 
-OperandReg Brigantine::createOperandReg(const SRef& name,const SourceInfo* srcInfo) {
-    OperandReg operand = m_container.append<OperandReg>();
+OperandRegister Brigantine::createOperandReg(const SRef& name,const SourceInfo* srcInfo) {
+    OperandRegister operand = m_container.append<OperandRegister>();
     annotate(operand,srcInfo);
     assert(name.length() > 2);
     assert(name[0] == '$');
     switch(name[1]) {
-    case 'c': operand.regKind() = Brig::BRIG_REGISTER_CONTROL; break;
-    case 's': operand.regKind() = Brig::BRIG_REGISTER_SINGLE; break;
-    case 'd': operand.regKind() = Brig::BRIG_REGISTER_DOUBLE; break;
-    case 'q': operand.regKind() = Brig::BRIG_REGISTER_QUAD; break;
+    case 'c': operand.regKind() = BRIG_REGISTER_KIND_CONTROL; break;
+    case 's': operand.regKind() = BRIG_REGISTER_KIND_SINGLE; break;
+    case 'd': operand.regKind() = BRIG_REGISTER_KIND_DOUBLE; break;
+    case 'q': operand.regKind() = BRIG_REGISTER_KIND_QUAD; break;
     default:
       assert(!"invalid register name");
     }
@@ -473,13 +487,10 @@ OperandRegVector Brigantine::createOperandRegVec(
 }
 */
 
-OperandCodeRef Brigantine::createFuncRef(const SRef& fnName, const SourceInfo* srcInfo) {
-    DirectiveExecutable fn = m_globalScope->get<DirectiveFunction>(fnName);
+OperandCodeRef Brigantine::createExecutableRef(const SRef& name, const SourceInfo* srcInfo) {
+    DirectiveExecutable fn = m_globalScope->get<DirectiveExecutable>(name);
     if (!fn) {
-        fn = m_globalScope->get<DirectiveIndirectFunction>(fnName);
-    }
-    if (!fn) {
-        brigWriteError("Unknown function",srcInfo);
+        brigWriteError("Unknown executable reference",srcInfo);
         return OperandCodeRef();
     }
     return createCodeRef(fn,srcInfo);
@@ -527,40 +538,47 @@ Operand Brigantine::createLabelList(const std::vector<SRef>& labels, const Sourc
     return operand;
 }
 
-OperandData Brigantine::createImmed(const SourceInfo* srcInfo) {
-    OperandData operand = m_container.append<OperandData>();
+OperandConstantBytes Brigantine::createImmed(SRef data, unsigned type, const SourceInfo* srcInfo) {
+    assert(!isArrayType(type));
+    return createOperandConstantBytes(data, type, false, srcInfo);
+}
+
+OperandAddress Brigantine::createRef(
+    DirectiveVariable var,
+    OperandRegister reg,
+    int64_t offset,
+    bool is32BitAddr,
+    const SourceInfo* srcInfo)
+{
+    OperandAddress operand = m_container.append<OperandAddress>();
     annotate(operand,srcInfo);
+    operand.symbol() = var;
+    operand.reg()    = reg;
+
+    if (is32BitAddr) {
+        operand.offset() = ((uint64_t)offset) & 0xFFFFFFFF;
+    } else {
+        operand.offset() = (uint64_t)offset;
+    }
     return operand;
 }
-
-OperandData Brigantine::createImmed(SRef data, const SourceInfo* srcInfo) {
-    OperandData operand = createImmed(srcInfo);
-    operand.data() = data;
-    return operand;
-}
-
 
 OperandAddress Brigantine::createRef(
     const SRef& symName,
-    OperandReg reg,
+    OperandRegister reg,
     int64_t offset,
+    bool is32BitAddr,
     const SourceInfo* srcInfo) {
-
-    OperandAddress operand = m_container.append<OperandAddress>();
-    annotate(operand,srcInfo);
-
+    DirectiveVariable nameDS;
     if (!symName.empty()) {
-        DirectiveVariable nameDS = findInScopes<DirectiveVariable>(symName);
+        nameDS = findInScopes<DirectiveVariable>(symName);
         if (!nameDS) {
             std::string name = symName;
             brigWriteError(("Symbol not found: " + name).c_str(),srcInfo);
             return OperandAddress();
         }
-        operand.symbol() = nameDS;
     }
-    operand.reg() = reg;
-    operand.offset() = (uint64_t)offset;
-    return operand;
+    return createRef(nameDS, reg, offset, is32BitAddr, srcInfo);
 }
 
 
@@ -594,17 +612,23 @@ void Brigantine::addSymbolToGlobalScope(DirectiveVariable sym) {
     m_globalScope->add(sym.name(), sym);
 }
 
+void Brigantine::addSymbolToGlobalScope(DirectiveModule sym) {
+    assert(isGlobalName(sym.name()));
+    assert(m_globalScope.get()!=NULL);
+    m_globalScope->add(sym.name(), sym);
+}
+
 void Brigantine::addSymbolToFunctionScope(DirectiveVariable sym) {
     assert(isLocalName(sym.name()));
     assert(m_funcScope.get());
-    sym.linkage() = Brig::BRIG_LINKAGE_FUNCTION;
-    sym.allocation() = Brig::BRIG_ALLOCATION_AUTOMATIC;
+    sym.linkage() = BRIG_LINKAGE_FUNCTION;
+    sym.allocation() = BRIG_ALLOCATION_AUTOMATIC;
     m_funcScope->add(sym.name(), sym);
 }
 
 void Brigantine::addSymbolToLocalScope(DirectiveVariable sym) {
     assert(isLocalName(sym.name()));
-    if (sym.segment()!=Brig::BRIG_SEGMENT_ARG) {
+    if (sym.segment()!=BRIG_SEGMENT_ARG) {
         assert(m_funcScope.get());
         m_funcScope->add(sym.name(), sym);
     } else

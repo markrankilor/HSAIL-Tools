@@ -1,7 +1,7 @@
 // University of Illinois/NCSA
 // Open Source License
 //
-// Copyright (c) 2013, Advanced Micro Devices, Inc.
+// Copyright (c) 2013-2015, Advanced Micro Devices, Inc.
 // All rights reserved.
 //
 // Developed by:
@@ -75,8 +75,6 @@ private:
     mutable unsigned      mProfile;
     unsigned              m_options;
 
-    static const int BRIG_OPERANDS_NUM = 5;
-
     Disassembler(const Disassembler&); // non-copyable
     const Disassembler &operator=(const Disassembler &);  // not assignable
 
@@ -92,7 +90,7 @@ public:
 
     Disassembler(BrigContainer& c, EFloatDisassemblyMode fmode=FloatDisassemblyModeRawBits)
         : brig(c), err(0), stream(0), indent(0), hasErr(false),
-          mModel(Brig::BRIG_MACHINE_LARGE), mProfile(Brig::BRIG_PROFILE_FULL),
+          mModel(BRIG_MACHINE_LARGE), mProfile(BRIG_PROFILE_FULL),
           m_options(fmode)
     {}
 
@@ -115,6 +113,7 @@ public:
         return "";
       }
     }
+    static std::string getInstMnemonic(Inst inst, unsigned model, unsigned profile);
 
     void log(std::ostream &s);                 // Request errors logging into stream s
     bool hasError() const { return hasErr; }   // Return error flag
@@ -127,7 +126,7 @@ private:
     void printDirectiveFmt(Code d) const;
     void printDirective(Directive d, bool dump = false) const;
 
-    void printDirective(DirectiveVersion d) const;
+    void printDirective(DirectiveModule d) const;
     void printDirective(DirectiveExecutable d) const;
     void printDirective(DirectiveLabel d) const;
     void printDirective(DirectiveComment d) const;
@@ -137,11 +136,8 @@ private:
     void printDirective(DirectivePragma d) const;
     void printDirective(DirectiveArgBlockStart d) const;
     void printDirective(DirectiveArgBlockEnd d) const;
-
     void printDirective(DirectiveVariable d) const;
     void printDirective(DirectiveFbarrier d) const;
-    void printMemFenceScope(unsigned segment, unsigned scope) const;
-
 
     void printArgs(Directive arg, unsigned paramNum) const;
     template <typename List>
@@ -152,7 +148,7 @@ private:
     void printSymDecl(DirectiveVariable d, bool isArg = false) const;
     void printArgDecl(Directive d) const;
 
-    void printValueList(SRef data, Brig::BrigType16_t type, uint64_t dim) const;
+    void printOperandConstantBytes(OperandConstantBytes opr) const;
 
     void printStringLiteral(SRef s) const;
     void printComment(SRef s) const;
@@ -192,7 +188,7 @@ private:
 
     void printCallArgs(Inst i) const;
     void printSbrArgs(Inst i) const;
-    void printInstArgs(Inst i, int firstArg = 0, int lastArg = BRIG_OPERANDS_NUM) const;
+    void printInstArgs(Inst i, int firstArg = 0, int lastArg = MAX_OPERANDS_NUM) const;
     template<class T> void print_width(T inst) const;
     void print_v(Inst i) const;
 
@@ -203,20 +199,22 @@ private:
     // Operands
 
     void printInstOperand(Inst i, unsigned operandIdx) const;
-    void printOperand(Operand opr, Brig::BrigType16_t type, bool dump = false) const;
+    void printOperand(Operand opr, bool dump = false) const;
+    void printTypedOperand(Operand opr, bool strict = true) const;
 
-    void printOperandReg(OperandReg opr) const;
+    void printOperandReg(OperandRegister opr) const;
     void printOperandCodeRef(OperandCodeRef opr) const;
     void printOperandCodeList(OperandCodeList opr) const;
-    void printListOfOperands(ListRef<Operand> list, Brig::BrigType16_t type, bool singleLine = true) const;
+    void printListOfOperands(ListRef<Operand> list, bool singleLine = true, bool typed = false, bool strict = true) const;
     void printOperandWavesize(OperandWavesize opr) const;
     void printOperandAddress(OperandAddress opr) const;
-    void printOperandImageProperties(OperandImageProperties opr, Brig::BrigType16_t type) const;
-    void printOperandSamplerProperties(OperandSamplerProperties opr, Brig::BrigType16_t type) const;
+    void printOperandConstantImage(OperandConstantImage opr) const;
+    void printOperandConstantOperandList(OperandConstantOperandList opr) const;
+    void printOperandConstantSampler(OperandConstantSampler opr) const;
     void printOperandString(OperandString opr) const;
+    void printOperandAlign(OperandAlign opr) const;
 
-    void printVector(OperandOperandList opr, Brig::BrigType16_t type) const;
-    void printImmed(OperandData opr, Brig::BrigType16_t type) const;
+    void printVector(OperandOperandList opr) const;
 
     SRef getSymbolName(Directive d) const;
 
@@ -226,7 +224,7 @@ private:
     const char* opcode2str(unsigned opcode) const;
     const char* type2str(unsigned t) const;
     const char* pack2str(unsigned t) const;
-    const char* seg2str(Brig::BrigSegment8_t  segment) const;
+    const char* seg2str(BrigSegment8_t  segment) const;
     const char* cmpOp2str(unsigned opcode) const;
     const char* atomicOperation2str(unsigned op) const;
     const char* imageGeometry2str(unsigned g) const;
@@ -236,22 +234,22 @@ private:
     const char* samplerQuery2str(unsigned g) const;
     const char* imageQuery2str(unsigned g) const;
     const char* machineModel2str(unsigned machineModel) const;
+    const char* defaultRound2str(unsigned round) const;
     const char* profile2str(unsigned profile) const;
     const char* ftz2str(unsigned ftz) const;
     const char* round2str(unsigned val) const;
     const char* memoryOrder2str(unsigned memOrder) const;
-    const char* memoryFenceSegments2str(unsigned flags) const;
     const char* memoryScope2str(unsigned flags) const;
     const char* class2str(unsigned val) const;
     const char* v2str(Operand opr) const;
-    const char* imageChannelType2str(Brig::BrigImageChannelType8_t fmt) const;
-    const char* imageChannelOrder2str(Brig::BrigImageChannelOrder8_t order) const;
+    const char* imageChannelType2str(BrigImageChannelType8_t fmt) const;
+    const char* imageChannelOrder2str(BrigImageChannelOrder8_t order) const;
     const char* width2str(unsigned val) const;
     const char* const2str(bool isConst) const;
     const char* nonull2str(bool isNoNull) const;
 
     std::string decl2str_(bool isDecl) const;
-    std::string attr2str_(Brig::BrigLinkage8_t attr) const;
+    std::string attr2str_(BrigLinkage8_t attr) const;
     std::string alloc2str_(unsigned alloc, unsigned segment) const;
     std::string exec2str_(DirectiveExecutable d) const;
     const char* const2str_(bool isConst) const;
@@ -259,6 +257,8 @@ private:
     std::string align2str(unsigned val) const;
     std::string equiv2str(unsigned val) const;
     std::string modifiers2str(AluModifier mod) const;
+    std::string registerKind2str(unsigned kind) const;
+    std::string controlDirective2str(unsigned val) const;
 
     bool hasType(Inst i) const;
 
@@ -285,7 +285,7 @@ private:
 
     template<typename T, size_t N>
     void printPackedValue(const T (&val)[N]) const {
-        *stream << '_' << typeX2str(CType2Brig<T,N>::value) << '(';
+        *stream << type2str(CType2Brig<T,N>::value) << '(';
         for(int i=N-1; i>0; --i) {
             printValue(val[i]);
             *stream << ',';
@@ -355,9 +355,9 @@ private:
     void printBrig(Operand opr) const { printOperand(opr, true); }
 
     bool wantsExtraNewLineBefore(Directive d) const {
-        return (    (d.brig()->kind == Brig::BRIG_KIND_DIRECTIVE_LABEL)
-                 || (d.brig()->kind == Brig::BRIG_KIND_DIRECTIVE_KERNEL)
-                 || (d.brig()->kind == Brig::BRIG_KIND_DIRECTIVE_FUNCTION));
+        return (    (d.kind() == BRIG_KIND_DIRECTIVE_LABEL)
+                 || (d.kind() == BRIG_KIND_DIRECTIVE_KERNEL)
+                 || (d.kind() == BRIG_KIND_DIRECTIVE_FUNCTION));
     }
 
     //-------------------------------------------------------------------------
@@ -372,7 +372,7 @@ private:
 
     const char* invalid(const char* type, unsigned val) const {
         hasErr = true;
-        if (err) *err << "Invalid Brig::" << type << " value " << val << '\n';
+        if (err) *err << "Invalid " << type << " value " << val << '\n';
         return "/*INVALID*/";
     }
 

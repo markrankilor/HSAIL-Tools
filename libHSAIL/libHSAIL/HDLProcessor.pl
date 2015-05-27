@@ -1,7 +1,7 @@
 # University of Illinois/NCSA
 # Open Source License
 #
-# Copyright (c) 2013, Advanced Micro Devices, Inc.
+# Copyright (c) 2013-2015, Advanced Micro Devices, Inc.
 # All rights reserved.
 #
 # Developed by:
@@ -289,7 +289,7 @@ use strict;
 #### For example:
 ####
 ####     BrigProp geom = 1d,  2d,  3d, 1db, 1da, 2da;
-####     BrigPrefix GEOMETRY; // Generated values will look like this: Brig::BRIG_GEOMETRY_1D
+####     BrigPrefix GEOMETRY; // Generated values will look like this: BRIG_GEOMETRY_1D
 ####
 #### 1.12 TESTGEN-SPECIFIC DIRECTIVES
 ####
@@ -356,7 +356,7 @@ use strict;
 my $textLicense = "// University of Illinois/NCSA
 // Open Source License
 //
-// Copyright (c) 2013, Advanced Micro Devices, Inc.
+// Copyright (c) 2013-2015, Advanced Micro Devices, Inc.
 // All rights reserved.
 //
 // Developed by:
@@ -796,7 +796,7 @@ sub addClone
 sub getClones
 {
     my ($name) = @_;
-    return grep { $hdlClone{$_} eq $name } keys %hdlClone;
+    return grep { $hdlClone{$_} eq $name } sort keys %hdlClone;
 }
 
 ###############################################################################
@@ -895,7 +895,7 @@ sub getPropKindName
 sub getInstPropsUs # unsorted
 {
     my ($inst, $kind) = @_;
-    return grep { $instPropKind{$inst}{$_} == $kind } keys %{$instPropKind{$inst}};
+    return grep { $instPropKind{$inst}{$_} == $kind } sort keys %{$instPropKind{$inst}};
 }
 
 sub getInstProps     { my ($inst, $kind) = @_; return sort(getInstPropsUs($inst, $kind)); }
@@ -1221,9 +1221,9 @@ sub getTargetPropName
 #
 # Externally-defined names
 #
-sub getTargetInstName         { my $name = shift;                   return "Brig::BRIG_OPCODE_" . uc($name); }
+sub getTargetInstName         { my $name = shift;                   return "BRIG_OPCODE_" . uc($name); }
 sub getTargetFormatClass      { my $name = shift; $name =~ s/_//g;  return 'Inst' . $name ; }
-sub getTargetFormatName       { my $name = shift;                   return 'Brig::BRIG_KIND_INST_' . uc($name); }
+sub getTargetFormatName       { my $name = shift;                   return 'BRIG_KIND_INST_' . uc($name); }
 sub getTargetCategoryName     { my $name = shift; $name =~ s/\./_/g; return "C_" . uc($name); }
 sub genTargetGetAttr          { my $prop = ucfirst(shift());         return "get${prop}Attr"; }
 
@@ -1247,7 +1247,7 @@ sub getTargetBrigValName
     {
         my $pref = uc(getBaseProp($prop)); # default value
         if ($hdlPropPref{getBaseProp($prop)}) { $pref = $hdlPropPref{getBaseProp($prop)} };
-        return 'Brig::BRIG_' . $pref . '_' . uc($val);
+        return 'BRIG_' . $pref . '_' . uc($val);
     }
 
     return $val;
@@ -1328,7 +1328,7 @@ sub dumpReqBase
 sub unique          # Return unique array elements
 {
     my %hash = map { $_, 1 } @_;
-    return keys %hash;
+    return sort keys %hash;
 }
 
 sub eqArrayElements
@@ -2237,9 +2237,9 @@ sub genReq
         }
         elsif (isChkEnd($chk)) # terminator: list of variants has finished
         {
-            print "    else \n";
+            print "    else\n";
             print "    {\n";
-            print "        invalidVariant(inst, ", join(', ', map { getTargetPropName($_) } keys %propVariants), ");\n";
+            print "        invalidVariant(inst, ", join(', ', map { getTargetPropName($_) } sort keys %propVariants), ");\n";
             print "    }\n";
             %propVariants = ();
         }
@@ -2560,11 +2560,14 @@ sub analyzePropAttrs
 
 sub analyzeAttrs
 {
+    # FIXME: generalize for arbitrary number of operands
+
     analyzePropAttrs('operand0', 'operand', sub { isOperandProp(shift(), 0); });
     analyzePropAttrs('operand1', 'operand', sub { isOperandProp(shift(), 1); });
     analyzePropAttrs('operand2', 'operand', sub { isOperandProp(shift(), 2); });
     analyzePropAttrs('operand3', 'operand', sub { isOperandProp(shift(), 3); });
     analyzePropAttrs('operand4', 'operand', sub { isOperandProp(shift(), 4); });
+    analyzePropAttrs('operand5', 'operand', sub { isOperandProp(shift(), 5); });
 
     analyzePropAttrs('width', 'width', sub { return shift() eq 'width'; });
     analyzePropAttrs('round', 'round', sub { return shift() eq 'round'; });
@@ -2758,7 +2761,7 @@ setContext;
 ###############################################################################
 # Main Optimizer
 
-for my $req (keys %hdlReq) {
+for my $req (sort keys %hdlReq) {
     setContext "optimizing requirement '$req'";
     optimizeReq($req);
 }
@@ -2867,7 +2870,7 @@ EOT
 genCommonDeclarations();
 
 print "\nprivate:\n";
-for my $prop (keys %hdlProp) {
+for my $prop (sort keys %hdlProp) {
     print '    static unsigned ', getTargetPropValListName($prop), "[];\n";
 }
 
@@ -2917,11 +2920,11 @@ print cpp(<<"EOT");
     |    {
 EOT
 
-for my $prop (keys %hdlProp) {
+for my $prop (sort keys %hdlProp) {
     print '    case ', getTargetPropName($prop), ': return ', (isBrigProp($prop)? 'true' : 'false'), ";\n";
 }
 
-for my $clone (keys %hdlClone) {
+for my $clone (sort keys %hdlClone) {
     print '    case ', getTargetPropName($clone), ': return ', (isBrigProp($hdlClone{$clone})? 'true' : 'false'), ";\n";
 }
 
@@ -3025,7 +3028,7 @@ sub printPropValues
     }
 }
 
-for my $prop (keys %hdlProp) {
+for my $prop (sort keys %hdlProp) {
     print "unsigned ${className}::", getTargetPropValListName($prop), "[] = \n{\n";
     printPropValues($prop);
     print "};\n\n"

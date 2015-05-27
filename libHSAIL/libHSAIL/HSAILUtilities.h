@@ -1,7 +1,7 @@
 // University of Illinois/NCSA
 // Open Source License
 //
-// Copyright (c) 2013, Advanced Micro Devices, Inc.
+// Copyright (c) 2013-2015, Advanced Micro Devices, Inc.
 // All rights reserved.
 //
 // Developed by:
@@ -58,9 +58,10 @@ class Directive;
 class DirectiveVariable;
 class DirectiveExecutable;
 class BrigContainer;
-class OperandReg;
+class OperandRegister;
 class OperandAddress;
-class OperandData;
+class OperandConstantBytes;
+class OperandConstantOperandList;
 class OperandCodeRef;
 struct SRef;
 
@@ -80,12 +81,13 @@ bool hasImageExtProps(Inst inst);     // checks opcode, type and operands
 
 bool     isDirective(unsigned id);
 SRef     getName(Directive d);
-unsigned getDataType(Directive d);
 unsigned getSegment(Directive d);
 unsigned getSymLinkage(Directive d);
 bool     isDecl(Directive d);
 bool     isDef(Directive d);
 DirectiveVariable getInputArg(DirectiveExecutable kernel, unsigned idx);
+uint64_t getVariableNumBytes(DirectiveVariable var);
+unsigned getVariableAlignment(DirectiveVariable var);
 unsigned getCtlDirOperandType(unsigned kind, unsigned idx);
 const char* validateCtlDirOperandBounds(unsigned kind, unsigned idx, uint64_t val);
 bool allowCtlDirOperandWs(unsigned kind);
@@ -103,6 +105,7 @@ unsigned getSegment(Inst inst);
 unsigned getPacking(Inst inst);
 unsigned getEqClass(Inst inst);
 
+unsigned getOperandsNum(Inst inst);
 unsigned getDefWidth(Inst inst, unsigned machineModel, unsigned profile);
 unsigned getDefRounding(Inst inst, unsigned machineModel, unsigned profile);
 
@@ -134,6 +137,9 @@ bool isImageInst(unsigned opcode);  // checks opcode only
 inline bool isGcnInst(unsigned opcode) { return (opcode & (1<<15))!=0; }
 bool isCallInst(unsigned opcode);
 bool isBranchInst(unsigned opcode);
+bool isIntArithInstr(unsigned opcode);
+bool isIntShiftInstr(unsigned opcode);
+bool isBitArithmInst(unsigned opcode);
 
 // True for instructions which unconditionally change control flow
 // so that next instruction is only reachable via a jump
@@ -147,13 +153,19 @@ bool     isCodeRef(OperandCodeRef cr, unsigned targetKind);
 
 unsigned getAddrSize(OperandAddress addr, bool isLargeModel);
 unsigned getSegAddrSize(unsigned segment, bool isLargeModel);
+bool     isAddressableSeg(unsigned segment);
 
 unsigned getRegKind(SRef opr);
-unsigned getRegSize(OperandReg reg);
-string getRegName(OperandReg reg);
+unsigned getRegSize(OperandRegister reg);
+string getRegName(OperandRegister reg);
 
-unsigned getImmSize(OperandData opr);
-bool     isImmB1(OperandData imm);
+unsigned getImmSize(OperandConstantBytes opr);
+bool     isImmB1(OperandConstantBytes imm);
+uint32_t getImmAsU32(OperandConstantBytes opr, unsigned index = 0);
+uint64_t getImmAsU64(OperandConstantBytes opr);
+
+uint64_t getAggregateNumBytes(OperandConstantOperandList opr);
+
 //============================================================================
 // Operations with types
 
@@ -168,17 +180,22 @@ bool       isBitType(unsigned type);
 bool       isOpaqueType(unsigned type);
 bool       isImageExtType(unsigned type);
 bool       isImageType(unsigned type);
+bool       isSamplerType(unsigned type);
+bool       isSignalType(unsigned type);
 bool       isFullProfileOnlyType(unsigned type);
 
 unsigned   packedType2baseType(unsigned type);
 unsigned   packedType2elementType(unsigned type);
-unsigned   convPackedType2U(unsigned type);
+unsigned   packedType2uType(unsigned type);
+unsigned   arrayElementType(unsigned type);
 
-bool       isValidImmType(unsigned type);
+unsigned   type2immType(unsigned elementType, bool isArray);
+bool       isValidImmType(unsigned elementType);
 bool       isValidVarType(unsigned type);
 
 unsigned   expandSubwordType(unsigned type);
-unsigned   convType2BitType(unsigned type);
+unsigned   type2bitType(unsigned type);
+unsigned   bitType2uType(unsigned type);
 unsigned   getBitType(unsigned size);
 unsigned   getSignedType(unsigned size);
 unsigned   getUnsignedType(unsigned size);
@@ -197,8 +214,8 @@ unsigned   getPackedDstDim(unsigned type, unsigned packing);
 //============================================================================
 // Operations with alignment
 
-Brig::BrigAlignment getNaturalAlignment(unsigned type);
-Brig::BrigAlignment getMaxAlignment();
+BrigAlignment getNaturalAlignment(unsigned type);
+BrigAlignment getMaxAlignment();
 bool                isValidAlignment(unsigned align, unsigned type);
 
 //============================================================================
@@ -213,6 +230,19 @@ size_t     align(size_t s, size_t pow2);
 size_t     zeroPaddedCopy(void *dst, const void* src, size_t len, size_t room);
 
 //============================================================================
+
+const BrigSectionHeader* getBrigSection(
+    BrigModule_t brigModule,
+    unsigned index);
+
+inline 
+const BrigSectionHeader* getBrigSection(
+    const BrigModuleHeader& brigModule,
+    unsigned index) {
+    // TODO remove const_cast
+    return getBrigSection(const_cast<BrigModuleHeader*>(&brigModule),
+                          index);
+}
 
 } // end namespace
 

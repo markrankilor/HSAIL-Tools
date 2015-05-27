@@ -1,7 +1,7 @@
 // University of Illinois/NCSA
 // Open Source License
 //
-// Copyright (c) 2013, Advanced Micro Devices, Inc.
+// Copyright (c) 2013-2015, Advanced Micro Devices, Inc.
 // All rights reserved.
 //
 // Developed by:
@@ -38,46 +38,51 @@
 // LIABILITY, WHETHER IN AN ACTION OF CONTRACT, TORT OR OTHERWISE, ARISING FROM,
 // OUT OF OR IN CONNECTION WITH THE SOFTWARE OR THE USE OR OTHER DEALINGS WITH THE
 // SOFTWARE.
-#ifndef __SECTION_HEADER_H__
-#define __SECTION_HEADER_H__
+#ifndef __BRIG_DWARF_GENERATOR_H__
+#define __BRIG_DWARF_GENERATOR_H__
 
-#include <vector>
+#include <string>
+#include <ostream>
+
+namespace HSAIL_ASM
+{
+	class BrigContainer;
+}
+
 
 namespace BrigDebug
 {
 
-class SectionHeaderTable
+// BrigDwarfGenerator generates debugging information from an existing
+// BRIG container, and can store that generated information into a BRIG
+// container
+//
+
+class BrigDwarfGenerator
 {
 public:
-	SectionHeaderTable()
-	{
-		m_data.push_back( '\0' );
-	}
-	
-	virtual ~SectionHeaderTable() {}
+	virtual ~BrigDwarfGenerator() {}
 
-	size_t addHeaderName( const std::string & headerName )
-	{
-		size_t newOffset = m_data.size();
-		m_data.insert( m_data.end(), headerName.begin(), headerName.end() );
-		m_data.push_back( '\0' );
-		return newOffset;
-	}
+	static BrigDwarfGenerator * Create( const std::string & producer,
+                                      const std::string & compilationDirectory,
+                                      const std::string & fileName,
+                                      bool includeSource = false, const std::string& producerOptions = "");
 
-	const char * rawHeaderData()
-	{
-		return &m_data[0];
-	}
+        virtual void log(std::ostream* out) = 0;
 
-	size_t rawHeaderSize()
-	{
-		return m_data.size();
-	}
+	// generate debug info for a BRIG container
+	//
+	virtual bool generate( /*const*/ HSAIL_ASM::BrigContainer & c ) = 0;
 
-private:
-	std::vector<char> m_data;
+	// store the generated debug info into a BRIG container
+	//
+	virtual bool storeInBrig( HSAIL_ASM::BrigContainer & c ) const = 0;
+
+protected:
+	explicit BrigDwarfGenerator() {}
+
 };
 
 } // end namespace BrigDebug
 
-#endif // #ifndef __SECTION_HEADER_H__
+#endif // __BRIG_DWARF_GENERATOR_H__

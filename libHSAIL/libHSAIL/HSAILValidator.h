@@ -1,7 +1,7 @@
 // University of Illinois/NCSA
 // Open Source License
 //
-// Copyright (c) 2013, Advanced Micro Devices, Inc.
+// Copyright (c) 2013-2015, Advanced Micro Devices, Inc.
 // All rights reserved.
 //
 // Developed by:
@@ -48,8 +48,6 @@
 #include "HSAILItems.h"
 #include <istream>
 #include <string>
-
-#define ENABLE_ADDRESS_SIZE_CHECK (0)
 
 using std::istream;
 

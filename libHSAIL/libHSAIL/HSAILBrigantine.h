@@ -1,7 +1,7 @@
 // University of Illinois/NCSA
 // Open Source License
 //
-// Copyright (c) 2013, Advanced Micro Devices, Inc.
+// Copyright (c) 2013-2015, Advanced Micro Devices, Inc.
 // All rights reserved.
 //
 // Developed by:
@@ -70,7 +70,7 @@ class Brigantine
     unsigned                m_profile;
 
     typedef std::vector< std::pair< ItemRef<Code>, SourceInfo > > RefList;
-    typedef std::map<Brig::BrigStringOffset32_t, RefList> LabelMap;
+    typedef std::map<BrigStringOffset32_t, RefList> LabelMap;
 
     LabelMap m_labelMap; // string offset -> array of label refs
 
@@ -83,7 +83,7 @@ public:
     /// won't syncronize it's state with it and therefore it is up to the user to
     /// supply the container in a state that allows to 'continue' writing consistently.
     /// Most common case is an empty Brig container.
-    Brigantine(BrigContainer& container) : m_container(container), m_machine(Brig::BRIG_MACHINE_UNDEF), m_profile(Brig::BRIG_PROFILE_UNDEF) {}
+    Brigantine(BrigContainer& container) : m_container(container), m_machine(BRIG_MACHINE_UNDEF), m_profile(BRIG_PROFILE_UNDEF) {}
     virtual ~Brigantine() {}
 
     /// start HSAIL program. While it doesn't write anything to the container it
@@ -96,14 +96,16 @@ public:
     /// @name Directives
     /// @{
 
-    /// emit DirectiveVersion to the container. Should be called after startProgram call.
+    /// emit DirectiveModule to the container. Should be called after startProgram call.
+    /// @param name - module name
     /// @param major - major version number
     /// @param minor - minor version number
-    /// @param machineModel - one of Brig::BrigMachineModel enum values
-    /// @param profile - one of Brig::BrigProfile enum values
+    /// @param machineModel - one of BrigMachineModel enum values
+    /// @param profile - one of BrigProfile enum values
+    /// @param defaultRounding - default rounding mode
     /// @param srcInfo - (optional) source location
-    DirectiveVersion version(Brig::BrigVersion32_t major,Brig::BrigVersion32_t minor,
-        Brig::BrigMachineModel8_t machineModel,Brig::BrigProfile8_t profile,
+    DirectiveModule module(const SRef& name,BrigVersion32_t major,BrigVersion32_t minor,
+        BrigMachineModel8_t machineModel,BrigProfile8_t profile,BrigRound8_t defaultRounding,
         const SourceInfo* srcInfo=NULL);
 
     /// emit DirectiveFunction to the container.
@@ -161,22 +163,15 @@ public:
     /// @param srcInfo - (optional) source location
     /// @{
 
-    DirectiveVariable   addSymbol(DirectiveVariable sym);
+    DirectiveVariable addSymbol(DirectiveVariable sym);
 
-    DirectiveVariable addVariable(const SRef& name, Brig::BrigSegment8_t segment, unsigned dType,const SourceInfo* srcInfo=NULL);
-    DirectiveVariable addArrayVariable(const SRef& name, uint64_t size, Brig::BrigSegment8_t segment, unsigned dType,const SourceInfo* srcInfo=NULL);
+    DirectiveVariable addVariable(const SRef& name, BrigSegment8_t segment, unsigned scalarType,const SourceInfo* srcInfo=NULL);
+    DirectiveVariable addArrayVariable(const SRef& name, uint64_t size, BrigSegment8_t segment, unsigned elemType,const SourceInfo* srcInfo=NULL);
 
-    DirectiveVariable addImage   (const SRef& name, Brig::BrigSegment8_t segment=Brig::BRIG_SEGMENT_GLOBAL, const SourceInfo* srcInfo=NULL);
-    DirectiveVariable addSampler (const SRef& name, Brig::BrigSegment8_t segment=Brig::BRIG_SEGMENT_GLOBAL, const SourceInfo* srcInfo=NULL);
+    DirectiveVariable addImage   (const SRef& name, BrigSegment8_t segment=BRIG_SEGMENT_GLOBAL, const SourceInfo* srcInfo=NULL);
+    DirectiveVariable addSampler (const SRef& name, BrigSegment8_t segment=BRIG_SEGMENT_GLOBAL, const SourceInfo* srcInfo=NULL);
 
     DirectiveFbarrier addFbarrier(const SRef& name,const SourceInfo* srcInfo=NULL);
-
-    /// append trailing zeroes to a symbol initializer. This is required by spec to match
-    /// initializer size with declared dimension of symbol. If the symbol doesn't have associated initializer
-    /// this routine creates one with type specified for the symbol. For nonarray symbols single zero value
-    /// initializer is created.
-    /// @param sym - DirectiveVariable.
-    void             appendTrailingZeroes(DirectiveVariable sym);
 
     /// @}
 
@@ -193,11 +188,11 @@ public:
     /// emit extension for the following instruction.
     /// @param name - any text.
     /// @param srcInfo - (optional) source location.
-    DirectiveLabel   addExtension(const char *name,const SourceInfo* srcInfo=NULL);
+    DirectiveExtension addExtension(const char *name,const SourceInfo* srcInfo=NULL);
 
     // TBD095 replace with addSampler, createSamplerInitializer
-    /*void CreateSampler(const SRef& name,const int normalized,const Brig::BrigSamplerFilter filter,
-                       const Brig::BrigSamplerBoundaryMode mode);*/
+    /*void CreateSampler(const SRef& name,const int normalized,const BrigSamplerFilter filter,
+                       const BrigSamplerBoundaryMode mode);*/
 
     /// @name Instructions
     /// emit instruction.
@@ -243,17 +238,29 @@ public:
       return createListOperand<OperandOperandList>(list, srcInfo);
     }
 
-    OperandData createOperandData(SRef data, const SourceInfo* srcInfo=NULL) {
-        OperandData operand = m_container.append<OperandData>();
+    OperandConstantOperandList createConstantOperandList(const ItemList& list, unsigned elementType, const SourceInfo* srcInfo=NULL) {
+      assert(!isArrayType(elementType));
+      OperandConstantOperandList opr = createListOperand<OperandConstantOperandList>(list, srcInfo);
+      opr.type() = elementType2arrayType(elementType);
+      return opr;
+    }
+
+    OperandConstantBytes createOperandConstantBytes(SRef data, unsigned elementType, bool isArray, const SourceInfo* srcInfo=NULL) {
+        assert(!isArrayType(elementType));
+
+        unsigned type = type2immType(elementType, isArray);
+        OperandConstantBytes operand = m_container.append<OperandConstantBytes>();
         annotate(operand, srcInfo);
-        operand.data() = data;
+        operand.bytes() = data;
+        operand.type() = type;
         return operand;
     }
+
     /// @name Register operands
-    /// emit OperandReg.
+    /// emit OperandRegister.
     /// @param name - register name including '$'.
     /// @param srcInfo - (optional) source location.
-    OperandReg          createOperandReg(const SRef& name, const SourceInfo* srcInfo=NULL);
+    OperandRegister createOperandReg(const SRef& name, const SourceInfo* srcInfo=NULL);
 
     /// @name Register vectors
     /// emit OperandRegVx.
@@ -299,7 +306,7 @@ public:
     /// @param fnName - function name including '&' (global name search)
     /// @param srcInfo - (optional) source location.
     /// @{
-    OperandCodeRef  createFuncRef(const SRef& fnName, const SourceInfo* srcInfo=NULL);
+    OperandCodeRef  createExecutableRef(const SRef& name, const SourceInfo* srcInfo=NULL);
     /// @}
 
     OperandCodeRef createSigRef(const SRef& fnName, const SourceInfo* srcInfo=NULL);
@@ -318,28 +325,28 @@ public:
     /// @param srcInfo - (optional) source location.
     /// @{
 
-    OperandData       createImmed(int64_t  v, Brig::BrigType16_t type, const SourceInfo* srcInfo=NULL) {
+    OperandConstantBytes createImmed(int64_t  v, BrigType16_t type, const SourceInfo* srcInfo=NULL) {
       int numBytes = getBrigTypeNumBytes(type);
       assert(numBytes <= 8);
-      return createImmed(SRef((const char*)&v, (const char*)&v + numBytes), srcInfo);
+      return createImmed(SRef((const char*)&v, (const char*)&v + numBytes), type, srcInfo);
     }
-    OperandData       createImmed(f32_t    v, Brig::BrigType16_t type, const SourceInfo* srcInfo=NULL) {
+    OperandConstantBytes createImmed(f32_t    v, BrigType16_t type, const SourceInfo* srcInfo=NULL) {
       int numBytes = getBrigTypeNumBytes(type);
       assert(numBytes == 4);
-      return createImmed(SRef((const char*)&v, (const char*)&v + sizeof(f32_t)), srcInfo);
+      return createImmed(SRef((const char*)&v, (const char*)&v + sizeof(f32_t)), type, srcInfo);
     }
-    OperandData       createImmed(f64_t    v, Brig::BrigType16_t type, const SourceInfo* srcInfo=NULL) {
+    OperandConstantBytes createImmed(f64_t    v, BrigType16_t type, const SourceInfo* srcInfo=NULL) {
       int numBytes = getBrigTypeNumBytes(type);
       assert(numBytes == 8);
-      return createImmed(SRef((const char*)&v, (const char*)&v + sizeof(f64_t)), srcInfo);
+      return createImmed(SRef((const char*)&v, (const char*)&v + sizeof(f64_t)), type, srcInfo);
     }
 
     /// @}
 
-    /// creates unitialized OperandData.
+    /// creates unitialized OperandConstantBytes.
     /// @param srcInfo - (optional) source location
-    OperandData       createImmed(const SourceInfo* srcInfo=NULL);
-    OperandData       createImmed(SRef data, const SourceInfo* srcInfo=NULL);
+    ///OperandConstantBytes createImmed(const SourceInfo* srcInfo=NULL);
+    OperandConstantBytes createImmed(SRef data, unsigned type, const SourceInfo* srcInfo=NULL);
 
     /// @name Memory access operands creators.
 
@@ -349,15 +356,18 @@ public:
     /// @param offset - offset (optional, that is 0).
     /// @param srcInfo - (optional) source location.
     /// at least one of symName,reg, offset should be supplied upon call.
-    OperandAddress     createRef(const SRef& symName, OperandReg reg, int64_t offset=0, const SourceInfo* srcInfo=NULL);
-    OperandAddress     createRef(const SRef& symName, int64_t offset=0, const SourceInfo* srcInfo=NULL) {
-        return createRef(symName, OperandReg(), offset, srcInfo);
+    OperandAddress     createRef(const SRef& symName, OperandRegister reg, int64_t offset=0, bool is32BitAddr = false, const SourceInfo* srcInfo=NULL);
+    OperandAddress     createRef(const SRef& symName, int64_t offset=0, bool is32BitAddr = false, const SourceInfo* srcInfo=NULL) {
+        return createRef(symName, OperandRegister(), offset, is32BitAddr, srcInfo);
     }
-    OperandAddress     createRef(const SRef& symName, SRef& reg, int64_t offset=0, const SourceInfo* srcInfo=NULL) {
-        return createRef(symName, reg.empty() ? OperandReg() : createOperandReg(reg, srcInfo), offset, srcInfo);
+    OperandAddress     createRef(const SRef& symName, SRef& reg, int64_t offset=0, bool is32BitAddr = false, const SourceInfo* srcInfo=NULL) {
+        return createRef(symName, reg.empty() ? OperandRegister() : createOperandReg(reg, srcInfo), offset, is32BitAddr, srcInfo);
     }
-    OperandCodeRef         createDirectiveRef(const SRef& name,const SourceInfo* srcInfo=NULL);
-    OperandCodeRef         createCodeRef(Code c,const SourceInfo* srcInfo=NULL);
+
+    OperandAddress     createRef(DirectiveVariable var, OperandRegister reg=OperandRegister(), int64_t offset=0, bool is32BitAddr = false, const SourceInfo* srcInfo=NULL);
+
+    OperandCodeRef     createDirectiveRef(const SRef& name,const SourceInfo* srcInfo=NULL);
+    OperandCodeRef     createCodeRef(Code c,const SourceInfo* srcInfo=NULL);
 
     OperandString createOperandString(const SRef& string, const SourceInfo* srcInfo=NULL) {
         OperandString operand = append<OperandString>(srcInfo);
@@ -367,7 +377,7 @@ public:
 
     /// create 'width' operand.
     /// @param srcInfo - (optional) source location.
-    OperandData       createWidthOperand(const Optional<uint32_t>& width,const SourceInfo* srcInfo=NULL);
+    OperandConstantBytes createWidthOperand(const Optional<uint32_t>& width,const SourceInfo* srcInfo=NULL);
 
     /// create 'Wavesize' operand.
     /// @param srcInfo - (optional) source location.
@@ -390,8 +400,8 @@ public:
     Dir            findInScopes(const SRef& name) const;
 
     /// return model.
-    unsigned       getMachineModel() const { assert(m_machine == Brig::BRIG_MACHINE_SMALL || m_machine == Brig::BRIG_MACHINE_LARGE); return m_machine; }
-    unsigned       getProfile()      const { assert(m_profile == Brig::BRIG_PROFILE_BASE  || m_profile == Brig::BRIG_PROFILE_FULL);  return m_profile; }
+    unsigned       getMachineModel() const { assert(m_machine == BRIG_MACHINE_SMALL || m_machine == BRIG_MACHINE_LARGE); return m_machine; }
+    unsigned       getProfile()      const { assert(m_profile == BRIG_PROFILE_BASE  || m_profile == BRIG_PROFILE_FULL);  return m_profile; }
 
 private:
     template <typename Item>
@@ -407,6 +417,7 @@ private:
     void addSymbolToFunctionScope(DirectiveVariable sym);
     void addSymbolToGlobalScope(DirectiveExecutable sym);
     void addSymbolToGlobalScope(DirectiveVariable sym);
+    void addSymbolToGlobalScope(DirectiveModule sym);
 
     bool checkForUnboundLabels();
     void recordLabelRef(ItemRef<Code> ref, const SRef& name, const SourceInfo*);
@@ -415,7 +426,7 @@ private:
     DirectiveLabel addLabelInternal(const SRef& name,const SourceInfo* srcInfo);
 
 //    template <typename Value> // this routine converts Value v to the requested brig type and save it into immediate
-//    OperandData createImmedT(Value v, Brig::BrigType16_t type, const SourceInfo* srcInfo=NULL);
+//    OperandConstantBytes createImmedT(Value v, BrigType16_t type, const SourceInfo* srcInfo=NULL);
 
     void brigWriteError(const char *errMsg, const SourceInfo* srcInfo);
 
@@ -473,7 +484,7 @@ InstItem Brigantine::addInst(unsigned opCode,const SourceInfo* srcInfo) {
     InstItem inst = m_container.append<InstItem>();
     annotate(inst,srcInfo);
     inst.opcode() = opCode;
-    inst.type() = Brig::BRIG_TYPE_B32;
+    inst.type() = BRIG_TYPE_B32;
     return inst;
 }
 

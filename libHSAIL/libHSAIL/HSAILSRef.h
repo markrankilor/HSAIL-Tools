@@ -1,7 +1,7 @@
 // University of Illinois/NCSA
 // Open Source License
 //
-// Copyright (c) 2013, Advanced Micro Devices, Inc.
+// Copyright (c) 2013-2015, Advanced Micro Devices, Inc.
 // All rights reserved.
 //
 // Developed by:
@@ -46,6 +46,7 @@
 #include <cstring>
 #include <vector>
 #include <iosfwd>
+#include <algorithm>
 
 namespace HSAIL_ASM {
 

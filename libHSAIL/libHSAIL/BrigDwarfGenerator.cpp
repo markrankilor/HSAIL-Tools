@@ -1,7 +1,7 @@
 // University of Illinois/NCSA
 // Open Source License
 //
-// Copyright (c) 2013, Advanced Micro Devices, Inc.
+// Copyright (c) 2013-2015, Advanced Micro Devices, Inc.
 // All rights reserved.
 //
 // Developed by:
@@ -54,6 +54,7 @@
 #define BDG_READ(f, b, l)    _read((f), (b), (unsigned int)(l))
 typedef long BdgLseekOff_t;
 typedef int BdgReadSize_t;
+#define tempnam _tempnam
 #else
 #include <unistd.h>
 #define BDG_OPEN             open
@@ -84,9 +85,42 @@ typedef size_t BdgReadSize_t;
 
 #include "hsa_dwarf.h"    // HSA extenstions to DWARF
 
-using std::cout;
-using std::endl;
+struct ProducerNote {
+  //===0
+  uint16_t prodsz;
+  uint16_t reserved;
+  //===4
+  uint32_t major;
+  //===8
+  uint32_t minor;
+  //===12
+  char prod[24];
+};
 
+const char *NOTENAME = "AMD";
+const uint32_t NOTENAMESZ = 3;
+
+char note_section_data[16384];
+size_t note_section_pos = 0;
+
+char *NoteAlloc(size_t size, size_t align)
+{
+  note_section_pos = (note_section_pos + align - 1) & ~(align - 1);
+  char *ptr = note_section_data + note_section_pos;
+  note_section_pos += size;
+  assert(note_section_pos < sizeof(note_section_data));
+  return ptr;
+}
+
+void AddNote(const uint32_t &note_type, const void *note_data,
+                       const uint32_t &note_size)
+{
+  memcpy(NoteAlloc(4, 4), &NOTENAMESZ, 4);
+  memcpy(NoteAlloc(4, 4), &note_size, 4);
+  memcpy(NoteAlloc(4, 4), &note_type, 4);
+  memcpy(NoteAlloc(4, 4), NOTENAME, 3);
+  memcpy(NoteAlloc((size_t) note_size, 4), note_data, (size_t) note_size);  
+}
 
 namespace BrigDebug
 {
@@ -185,56 +219,6 @@ public:
     }
 };
 
-#if 0
-class BRIGDwarfRelocationsTable
-{
-private:
-    /* pre-allocate memory for 10 items */
-    static const unsigned initialSize = 10;
-    std::vector<Elf32_Rel> m_data;
-
-    unsigned addEntry(const Elf32_Rel& rel)
-    {
-        m_data.push_back(rel);
-        return m_data.size() - 1;
-    }
-
-public:
-
-    BRIGDwarfRelocationsTable(unsigned initialTableSize = BRIGDwarfRelocationsTable::initialSize)
-    {
-        /* reserve some items */
-        m_data.reserve(initialTableSize);
-    }
-
-    virtual ~BRIGDwarfRelocationsTable() {}
-
-    const void* rawRelocationTableData() const
-    {
-        return &m_data.at(0);
-    }
-
-    unsigned getNumberOfRelocations() const
-    {
-        return static_cast<unsigned>(m_data.size());
-    }
-
-    unsigned getRelocationsTableSize() const
-    {
-        return static_cast<unsigned>(m_data.size()*sizeof(Elf32_Rel));
-    }
-
-    unsigned addRelocationEntry(Elf32_Addr offset, Elf32_Word symbol, Elf32_Byte relType)
-    {
-        Elf32_Rel relRecord;
-        relRecord.r_offset = offset;
-        relRecord.r_info = ELF32_R_INFO(symbol, relType);
-        return addEntry(relRecord);
-    }
-
-};
-#endif
-
 // class BrigDwarfGenerator_impl implements the BrigDwarfGenerator
 // interface: 1) it generates DWARF format debug information for a specified
 // BRIG container, and 2) it stores the that generated debug information into
@@ -247,8 +231,12 @@ class BrigDwarfGenerator_impl : public BrigDwarfGenerator
 public:
     BrigDwarfGenerator_impl( const std::string & producer,
                              const std::string & compilationDirectory,
-                             const std::string & fileName );
+                             const std::string & fileName,
+                             bool includeSource,
+                             const std::string& producerOptions_ );
     virtual ~BrigDwarfGenerator_impl() {}
+
+    void log(std::ostream* out) { this->out = out; }
 
     // create DWARF representation from the Brig container
     //
@@ -261,7 +249,7 @@ public:
     //
     bool storeInBrig( HSAIL_ASM::BrigContainer & c ) const;
 
-    int DwarfProducerCallback2( char * name,
+    int DwarfProducerCallback2( const char * name,
                                 int    size,
                                 Dwarf_Unsigned type,
                                 Dwarf_Unsigned flags,
@@ -291,24 +279,11 @@ private:
                                              HSAIL_ASM::Code firstIn,
                                              HSAIL_ASM::Code firstAfter );
 
-    // convert DWARF structures to disk file format in a memory-resident ELF container
-    //
-    void buildElfContainer();
-
     // buidElfContainer helper routines
     //
     void initializeElf();
     void finalizeElf();
-    void createDwarfElfSections();
-
-#if 0
-    unsigned createElfSymbolTable();
-    unsigned createElfStringTable( unsigned strTabNameOffset );
-    void dumpDwarfRelocations();
-    // set proper types of relocations in DWARF
-    //
-    void processRelocations();
-#endif
+    void createDwarfElfSections( HSAIL_ASM::BrigContainer & c );
 
     void readElfBytesIntoContainer();
 
@@ -395,20 +370,31 @@ private:
     // shows whether we have already called dwarf_lne_set_address()
     //
     bool m_isDwarfLineSetAddressCalled;
+
+    bool m_includeSource;
+
+    std::string producerOptions;
+
+    std::ostream* out;
+    std::string tmpFileName;
 };
 
 BrigDwarfGenerator *
 BrigDwarfGenerator::Create( const std::string & producer,
                             const std::string & compilationDirectory,
-                            const std::string & fileName )
+                            const std::string & fileName,
+                            bool includeSource,
+                            const std::string& producerOptions)
 {
     return new BrigDwarfGenerator_impl( producer, compilationDirectory,
-                                        fileName );
+                                        fileName, includeSource, producerOptions );
 }
 
 BrigDwarfGenerator_impl::BrigDwarfGenerator_impl( const std::string & producer,
                                                   const std::string & compilationDirectory,
-                                                  const std::string & fileName ) :
+                                                  const std::string & fileName,
+                                                  bool includeSource,
+                                                  const std::string& producerOptions_ ) :
     m_pDwarfDebug( 0 ),
     m_pCompileUnit( 0 ),
     m_producerStr( producer ),
@@ -418,7 +404,10 @@ BrigDwarfGenerator_impl::BrigDwarfGenerator_impl( const std::string & producer,
     m_directivesSymbol( 0xDA7A ),
     m_symbolTableSection( 0x7AB1 ),
     m_pElf( 0 ), m_pElfHeader( 0 ), m_elfFd( -1 ),
-    m_isDwarfLineSetAddressCalled(false)
+    m_isDwarfLineSetAddressCalled(false),
+    m_includeSource(includeSource),
+    producerOptions(producerOptions_),
+    out(&std::cout)
 {
 }
 
@@ -431,14 +420,14 @@ bool BrigDwarfGenerator_impl::generate( HSAIL_ASM::BrigContainer & c )
         initializeElf();
         generateDwarfForBrig( c );
         assert( m_pDwarfDebug );
-        createDwarfElfSections();
+        createDwarfElfSections( c );
         finalizeElf();
         readElfBytesIntoContainer();
         finalizeDwarfProducer();
     }
     catch ( const Error & e )
     {
-        std::cerr << "BrigDwarfGenerator_impl: error: " << e.m_errorMessage << std::endl;
+        *out << "Error: dwarf generation: " << e.m_errorMessage << std::endl;
         return false;
     }
 
@@ -456,6 +445,21 @@ bool BrigDwarfGenerator_impl::generate( HSAIL_ASM::BrigContainer & c )
 // *sec_name_index is an OUT parameter, a pointer to the shared string table
 // (.shrstrtab) offset for thte name of the section
 //
+static int DwarfProducerCallbackFunc2( const char * name,
+                                       int    size,
+                                       Dwarf_Unsigned type,
+                                       Dwarf_Unsigned flags,
+                                       Dwarf_Unsigned link,
+                                       Dwarf_Unsigned info,
+                                       Dwarf_Unsigned * sect_name_index,
+                                       void * user_data,
+                                       int  * error ){
+    BrigDwarfGenerator_impl * pBdig = (BrigDwarfGenerator_impl *) user_data;
+    return pBdig->DwarfProducerCallback2( name, size, type, flags, link,
+                                            info, sect_name_index );
+}
+
+#if defined(LIBDWARF_USE_INIT_C)
 static int DwarfProducerCallbackFunc( char * name,
                                       int    size,
                                       Dwarf_Unsigned type,
@@ -466,14 +470,13 @@ static int DwarfProducerCallbackFunc( char * name,
                                       void * user_data,
                                       int  * error )
 {
-    BrigDwarfGenerator_impl * pBdig = (BrigDwarfGenerator_impl *) user_data;
-    int rv = pBdig->DwarfProducerCallback2( name, size, type, flags, link,
-                                            info, sect_name_index );
-    return rv;
+    return DwarfProducerCallbackFunc2( name, size, type, flags, link, info,
+                                      sect_name_index, user_data, error );
 }
+#endif
 
 int
-BrigDwarfGenerator_impl::DwarfProducerCallback2( char * name,
+BrigDwarfGenerator_impl::DwarfProducerCallback2( const char * name,
                                                  int    size,
                                                  Dwarf_Unsigned type,
                                                  Dwarf_Unsigned flags,
@@ -514,14 +517,6 @@ BrigDwarfGenerator_impl::DwarfProducerCallback2( char * name,
 
     *sect_name_index = m_symbolTable.addSectionSymbolEntry(sectionIndex);
 
-#if 0
-    cout << "Section " << name
-         << " shstrab index = " << shdr->sh_name
-         << " section header index = "   << sectionIndex
-         << " symtab index = " << *sect_name_index
-         << endl;
-#endif
-
     return sectionIndex;
 }
 
@@ -537,7 +532,6 @@ static void DwarfErrorHandler( Dwarf_Error theError, Dwarf_Ptr errarg)
 void BrigDwarfGenerator_impl::initializeDwarfProducer()
 {
     int pointerSize = DW_DLC_SIZE_32;
-    Dwarf_Ptr errarg = 0;
     Dwarf_Error pErr  = 0;
     Dwarf_Error * nullError = 0;
 
@@ -547,21 +541,35 @@ void BrigDwarfGenerator_impl::initializeDwarfProducer()
     //
     //unsigned initFlags = DW_DLC_WRITE | pointerSize | DW_DLC_SYMBOLIC_RELOCATIONS;
     unsigned initFlags = DW_DLC_WRITE | pointerSize | DW_DLC_STREAM_RELOCATIONS;
-    Dwarf_Handler errorHandlerFunc = 0;
-    void * userData = this;
-
-    m_pDwarfDebug = dwarf_producer_init_c( initFlags,
-                                           DwarfProducerCallbackFunc,
-                                           DwarfErrorHandler,
-                                           0 /* errarg */, userData, &pErr );
 
     // only on the init call do we need to check the return value, for all
     // other calls we pass in a "nullError" so that the DwarfErrorHandler
     // is called
     //
-
+#if defined(LIBDWARF_USE_INIT_C)
+    m_pDwarfDebug = dwarf_producer_init_c( initFlags,
+                                           DwarfProducerCallbackFunc,
+                                           DwarfErrorHandler,
+                                           nullptr, this, &pErr );
     if ( pErr != 0 )
         error( "dwarf_producer_init_c", pErr );
+#else
+    auto ret = dwarf_producer_init( initFlags,
+                                           DwarfProducerCallbackFunc2,
+                                           DwarfErrorHandler,
+                                           nullptr, this,
+                                           "x86", "V2", nullptr,
+                                           &m_pDwarfDebug,
+                                           &pErr );
+    if (ret != DW_DLV_OK)
+        error( "dwarf_producer_init", pErr );
+#endif
+
+    std::string fileName = m_fileNameStr;
+    if (m_includeSource) {
+      m_compilationDirectoryStr = "";
+      fileName = "hsa::self().elf(\".source\"):text";
+    }
 
     Dwarf_P_Die pParent = 0;
     Dwarf_P_Die pChild = 0;
@@ -593,7 +601,7 @@ void BrigDwarfGenerator_impl::initializeDwarfProducer()
     unsigned nullTimeModified = 0;
     unsigned nullFileLength = 0;
     m_srcFileLineTableIndex = dwarf_add_file_decl( m_pDwarfDebug,
-                                                   (char *)m_fileNameStr.c_str(),
+                                                   (char *)fileName.c_str(),
                                                    defaultDirectoryIndex,
                                                    nullTimeModified,
                                                    nullFileLength, nullError );
@@ -608,11 +616,9 @@ void BrigDwarfGenerator_impl::generateDwarfForBrig( HSAIL_ASM::BrigContainer & c
     HSAIL_ASM::Code nextD;
     for ( HSAIL_ASM::Code d = c.code().begin(); d != c.code().end(); d = nextD )
     {
-        // cout << "offset 0x" << std::hex << d.brigOffset() << ": ";
-
-        switch ( d.brig()->kind )
+        switch ( d.kind() )
         {
-        case Brig::BRIG_KIND_DIRECTIVE_VARIABLE:
+        case BRIG_KIND_DIRECTIVE_VARIABLE:
          {
              // add this symbol's entry as a child of the compile unit
              // of type "variable"
@@ -622,8 +628,8 @@ void BrigDwarfGenerator_impl::generateDwarfForBrig( HSAIL_ASM::BrigContainer & c
              break;
          }
 
-         case Brig::BRIG_KIND_DIRECTIVE_FUNCTION:
-         case Brig::BRIG_KIND_DIRECTIVE_KERNEL:
+         case BRIG_KIND_DIRECTIVE_FUNCTION:
+         case BRIG_KIND_DIRECTIVE_KERNEL:
          {
              HSAIL_ASM::DirectiveExecutable dExe( d );
              generateDwarfForBrigKernelFunction( dExe );
@@ -632,15 +638,9 @@ void BrigDwarfGenerator_impl::generateDwarfForBrig( HSAIL_ASM::BrigContainer & c
          }
 
          default:
-            //cout << endl;
             nextD = d.next();
             break;
         }
-
-        //if ( d.brig()->kind == Brig::BRIG_KIND_DIRECTIVE_VARIABLE_INIT )
-        //    cout << "DirectiveVariableInit (dump skipped)" << endl;
-        //else
-        //    d.dump( cout );
     }
 }
 
@@ -654,7 +654,7 @@ BrigDwarfGenerator_impl::generateDwarfForBrigSymbol( HSAIL_ASM::Directive d,
                                                      unsigned dwarfTag)
 {
     HSAIL_ASM::DirectiveVariable dSym( d );
-    Brig::BrigDirectiveVariable * pBds( dSym.brig() );
+    BrigDirectiveVariable * pBds( dSym.brig() );
     Dwarf_Error * nullError( 0 );
     Dwarf_P_Die nullSibling( 0 );
 
@@ -730,7 +730,7 @@ void BrigDwarfGenerator_impl::generateDwarfForBrigKernelFunction( HSAIL_ASM::Dir
     declColumn = pSrcInfo->column + 1;
     firstInArg = d.firstInArg();
     numInParams = d.inArgCount();
-    if ( d.brig()->kind == Brig::BRIG_KIND_DIRECTIVE_FUNCTION ) {
+    if ( d.kind() == BRIG_KIND_DIRECTIVE_FUNCTION ) {
       isKernel = false;
       firstOutParam = d.next();
       numOutParams = d.outArgCount();
@@ -886,12 +886,12 @@ void BrigDwarfGenerator_impl::generateDwarfForBrigSubprogramBody(
     //
     while ( d != firstDirectiveAfterSubprogram )
     {
-        switch ( d.brig()->kind )
+        switch ( d.kind() )
         {
-         case Brig::BRIG_KIND_DIRECTIVE_VARIABLE:
+         case BRIG_KIND_DIRECTIVE_VARIABLE:
          {
              HSAIL_ASM::DirectiveVariable dSym( d );
-             if ( inArgScope && ( dSym.segment() == Brig::BRIG_SEGMENT_ARG ) )
+             if ( inArgScope && ( dSym.segment() == BRIG_SEGMENT_ARG ) )
              {
                  // argument variable, parent entry is arg scope
                  //
@@ -913,11 +913,11 @@ void BrigDwarfGenerator_impl::generateDwarfForBrigSubprogramBody(
              break;
          }
 
-         case Brig::BRIG_KIND_DIRECTIVE_ARG_BLOCK_START:
+         case BRIG_KIND_DIRECTIVE_ARG_BLOCK_START:
             inArgScope = true;
             break;
 
-         case Brig::BRIG_KIND_DIRECTIVE_ARG_BLOCK_END:
+         case BRIG_KIND_DIRECTIVE_ARG_BLOCK_END:
             // We have reached the end of the current argument scope -- "forget" the
             // current argscope entry (if there is one).
             // This is not a leak of pArgScopeEntry, dwarf tracks all allocations
@@ -943,65 +943,14 @@ void BrigDwarfGenerator_impl::generateDwarfForBrigSubprogramBody(
 
 bool BrigDwarfGenerator_impl::storeInBrig( HSAIL_ASM::BrigContainer & c ) const
 {
-  c.initSectionRaw(Brig::BRIG_SECTION_INDEX_IMPLEMENTATION_DEFINED, "hsa_debug");
+  int index = c.getNumSections();
+  c.initSectionRaw(index, "hsa_debug");
   if (!m_elfContainer.empty()) {
-    c.debugInfo().insertData(c.debugInfo().size(), (const char*)&m_elfContainer[0], (const char*)&m_elfContainer[0] + m_elfContainer.size());
+    HSAIL_ASM::BrigSectionImpl& sec = c.sectionById(index);
+    sec.insertData(sec.size(), (const char*)&m_elfContainer[0], (const char*)&m_elfContainer[0] + m_elfContainer.size());
   }
   return true;
 }
-
-#if 0
-void BrigDwarfGenerator_impl::dumpDwarfRelocations()
-{
-    Dwarf_Error err = 0;
-    Dwarf_Unsigned reloc_sections_count = 0;
-    int drd_version = 0;
-    int res = dwarf_get_relocation_info_count(m_pDwarfDebug, &reloc_sections_count,
-        &drd_version,&err);
-    if( res != DW_DLV_OK) {
-        cout << "Error getting relocation info count." << endl;
-        return;
-
-    }
-    cout << "Relocations sections count= " << reloc_sections_count <<
-        " relversion=" << drd_version << endl;
-
-    for( Dwarf_Unsigned ct = 0; ct < reloc_sections_count ; ++ct) {
-        // elf_section_index is the elf index of the relocations
-        // themselves.
-        Dwarf_Signed elf_section_index = 0;
-        // elf_section_index_link is the elf index of the section
-        // the relocations apply to.
-        Dwarf_Signed elf_section_index_link = 0;
-        // relocation_buffer_count is the number of relocations
-        // of this section.
-        Dwarf_Unsigned relocation_buffer_count = 0;
-        Dwarf_Relocation_Data reld;
-        res = dwarf_get_relocation_info(m_pDwarfDebug, &elf_section_index,
-            &elf_section_index_link,
-            &relocation_buffer_count,
-            &reld,&err);
-        if (res != DW_DLV_OK) {
-            cout << "Error getting relocation record " <<
-                ct << "."  << endl;
-            return;
-        }
-        cout << "Relocs for sec " << ct << " elf-sec=" << elf_section_index <<
-            " link="      << elf_section_index_link <<
-            " bufct="     << relocation_buffer_count << endl;
-
-        for (Dwarf_Unsigned r = 0; r < relocation_buffer_count; ++r) {
-            Dwarf_Relocation_Data rec = reld+r;
-            cout << "\tRelocation record " << r << ":" << endl;
-            cout << "\t\ttype:   " << (unsigned)rec->drd_type << endl;
-            cout << "\t\tlength: " << (unsigned)rec->drd_length << endl;
-            cout << "\t\toffset: " << (unsigned)rec->drd_offset << endl;
-            cout << "\t\tsymidx: " << (unsigned)rec->drd_symbol_index << endl;
-        }
-    }
-    return;
-}
-#endif
 
 void BrigDwarfGenerator_impl::createCodeAndDirectivesSections()
 {
@@ -1010,53 +959,6 @@ void BrigDwarfGenerator_impl::createCodeAndDirectivesSections()
     DwarfProducerCallback2((char*)".brigcode", 0, SHT_NOBITS, 0, 0, 0, &bcs);
     m_codeSymbol = bcs;
     m_directivesSymbol = bds;
-}
-
-#if 0
-unsigned BrigDwarfGenerator_impl::createElfSymbolTable( )
-{
-    Elf_Scn * strscn = elf_newscn( m_pElf );
-    if ( ! strscn )
-        error( "Error in elf_newscn in createElfSymbolTable" );
-
-    Elf_Data * shstr = elf_newdata( strscn );
-    if ( ! shstr )
-        error( "Error in elf_newdata in createElfSymbolTable" );
-
-    shstr->d_buf = const_cast<void *>(m_symbolTable.rawSymbolTableData()); /* WRONG */
-    shstr->d_type =  ELF_T_SYM;
-    shstr->d_size = m_symbolTable.getSymbolTableSize();
-    shstr->d_off = 0;
-    shstr->d_align = sizeof(Elf32_Sym);
-    shstr->d_version = EV_CURRENT;
-
-    Elf32_Shdr * strshdr = elf32_getshdr( strscn );
-    if ( ! strshdr )
-        error( "error in elf32_getshdr in createElfSymbolTable()" );
-
-    strshdr->sh_name = m_sectionHeaderTable.addHeaderName( ".symtab" );
-    strshdr->sh_type= SHT_SYMTAB;
-    strshdr->sh_flags = 0;
-    strshdr->sh_addr = 0;
-    strshdr->sh_offset = 0;
-    strshdr->sh_size = 0;
-    strshdr->sh_link  = (Elf32_Word)(0xDEADBEEF); /* caller must provide exact value */
-    strshdr->sh_info = m_symbolTable.getNumberOfSymbols();
-    strshdr->sh_addralign = 4;
-    strshdr->sh_entsize = 0;
-    return  elf_ndxscn(strscn);
-}
-#endif
-
-void BrigDwarfGenerator_impl::buildElfContainer()
-{
-    assert( m_pDwarfDebug );
-
-    initializeElf();
-    createDwarfElfSections();
-    //dumpDwarfRelocations();
-    finalizeElf();
-    readElfBytesIntoContainer();
 }
 
 unsigned BrigDwarfGenerator_impl::initializeShStrTab( unsigned strTabNameOffset)
@@ -1153,20 +1055,25 @@ unsigned BrigDwarfGenerator_impl::finalizeSymTab(unsigned symTab)
 
 void BrigDwarfGenerator_impl::initializeElf()
 {
-	std::string outFileName( m_fileNameStr + ".dbg" );
-	m_elfFd = BDG_OPEN( outFileName.c_str(), BDG_OPEN_FLAGS, BDG_OPEN_PERMS );
+    tmpFileName = tempnam(".", ".dbg");
+    m_elfFd = BDG_OPEN( tmpFileName.c_str(), BDG_OPEN_FLAGS, BDG_OPEN_PERMS );
 
     if ( m_elfFd < 0 )
-	{
-		std::stringstream ss;
-		ss << "Unable to open " << outFileName << " for writing";
+    {
+        std::stringstream ss;
+        ss << "Failed to open " << tmpFileName << " for writing";
         error( ss.str() );
-	}
+    }
 
     if ( elf_version(EV_CURRENT) == EV_NONE )
         error( "Bad elf_version" );
 
-    m_pElf = elf_begin( m_elfFd, ELF_C_WRITE, 0 );
+    m_pElf = elf_begin( m_elfFd, ELF_C_WRITE, 0
+#ifdef AMD_LIBELF
+                                                              , NULL
+#else
+#endif
+);
     if ( ! m_pElf )
         error( "elf_begin() failed" );
 
@@ -1198,80 +1105,7 @@ void BrigDwarfGenerator_impl::initializeElf()
     createCodeAndDirectivesSections();
 }
 
-#if 0
-void BrigDwarfGenerator_impl::processRelocations()
-{
-    Dwarf_Error err = 0;
-
-    // Since we are emitting in final form sometimes, we may
-    // do relocation processing here or we may
-    // instead emit relocation records into the object file.
-    // The following is for DW_DLC_SYMBOLIC_RELOCATIONS.
-    Dwarf_Unsigned reloc_sections_count = 0;
-    int drd_version = 0;
-    int res = dwarf_get_relocation_info_count(m_pDwarfDebug, &reloc_sections_count,
-        &drd_version,&err);
-    if( res != DW_DLV_OK) {
-        error( "Error getting relocation info count in processRelocations()" );
-    }
-    cout << "Relocations sections count= " << reloc_sections_count <<
-        " relversion=" << drd_version << endl;
-
-    // pre-allocate memory for vectors of relocation sections
-    m_relocationsTables.resize(reloc_sections_count);
-
-    for( Dwarf_Unsigned ct = 0; ct < reloc_sections_count ; ++ct) {
-        // elf_section_index is the elf index of the relocations
-        // themselves.
-        Dwarf_Signed elf_section_index = 0;
-        // elf_section_index_link is the elf index of the section
-        // the relocations apply to.
-        Dwarf_Signed elf_section_index_link = 0;
-        // relocation_buffer_count is the number of relocations
-        // of this section.
-        Dwarf_Unsigned relocation_buffer_count = 0;
-        Dwarf_Relocation_Data reld;
-        res = dwarf_get_relocation_info(m_pDwarfDebug,&elf_section_index,
-            &elf_section_index_link,
-            &relocation_buffer_count,
-            &reld,&err);
-        if (res != DW_DLV_OK) {
-            error( "Error getting relocation record in processRelocations()" );
-        }
-        cout << "Relocs for sec " << ct << " elf-sec=" << elf_section_index <<
-            " link="      << elf_section_index_link <<
-            " bufct="     << relocation_buffer_count << endl;
-        Elf_Scn *scn =  elf_getscn(m_pElf, elf_section_index_link);
-        if(!scn) {
-            error( "Error in elf_getscn in processRelocations()" );
-        }
-
-        /* construct relocations table manually */
-        BRIGDwarfRelocationsTable& bdrt = m_relocationsTables.at(ct);
-
-        for (Dwarf_Unsigned r = 0; r < relocation_buffer_count; ++r) {
-            Dwarf_Relocation_Data rec = &reld[r];
-            if( rec->drd_type != dwarf_drt_data_reloc ) {
-                error( "unexpected relocation type met in processRelocations()" );
-            }
-            if( rec->drd_length != 4 ) {
-                error( "unexpected relocation record length met in processRelocations()" );
-            }
-            cout << "\tRR " << r
-                 << ": length = " << (unsigned)rec->drd_length
-                 << ", offset = " << rec->drd_offset
-                 << ", symidx = " << rec->drd_symbol_index
-                 << ", type = " << (unsigned)rec->drd_type << endl;
-            bdrt.addRelocationEntry(rec->drd_offset, rec->drd_symbol_index, R_HSA_DWARF_TO_BRIG32);
-        }
-
-        /* bind it to the corresponding elf section */
-        // TODO complete this function if necessary, otherwise remove it completely
-    }
-}
-#endif
-
-void BrigDwarfGenerator_impl::createDwarfElfSections()
+void BrigDwarfGenerator_impl::createDwarfElfSections( HSAIL_ASM::BrigContainer & c )
 {
     Dwarf_Error * nullError = 0;
     Dwarf_Signed sectioncount = dwarf_transform_to_disk_form( m_pDwarfDebug, 0 );
@@ -1314,10 +1148,7 @@ void BrigDwarfGenerator_impl::createDwarfElfSections()
             {
                 Elf32_Rel *rr = static_cast<Elf32_Rel *>((void*)(relBytes + rrOffset));
                 unsigned relSym  = ELF32_R_SYM(rr->r_info);
-                unsigned relType = ELF32_R_TYPE(rr->r_info);
-#if 0
-                cout << "offset = " << rr->r_offset << ", sym = " << relSym << ", type = " << relType << endl;
-#endif
+
                 if(relSym == m_codeSymbol)
                 {
                     rr->r_info = ELF32_R_INFO(relSym, __R_HSA_DWARF_TO_BRIG_CODE32);
@@ -1326,13 +1157,90 @@ void BrigDwarfGenerator_impl::createDwarfElfSections()
                 {
                     rr->r_info = ELF32_R_INFO(relSym, __R_HSA_DWARF_TO_BRIG_DIRECTIVES32);
                 }
+#if defined(AMD_LIBELF)
                 else
                 {
-                    rr->r_info = ELF32_R_INFO(relSym, __R_HSA_DWARF_32);
+                    /* libDWARF must set default type of relocations */
+                    assert(__R_HSA_DWARF_32 == ELF32_R_TYPE(rr->r_info));
                 }
-
+#endif // defined(AMD_LIBELF)
             }
         }
+    }
+
+    // Notes
+    note_section_pos = 0;
+    memset(note_section_data, 0, sizeof(note_section_data));
+    ProducerNote pn;
+    memset(&pn, '\0', sizeof(pn));
+    pn.prodsz = 24;
+    pn.major = 0; // TODO
+    pn.minor = 0; // TODO
+    memcpy(pn.prod, "AMD HSA HSAIL Assembler", 23);
+
+   
+    AddNote(NT_AMDGPU_HSA_PRODUCER, &pn, uint32_t(sizeof(pn)));
+    AddNote(NT_AMDGPU_HSA_PRODUCER_OPTIONS, producerOptions.c_str(), producerOptions.length() + 1);
+    #define SELFREF "hsa::self():dwarf"
+    AddNote(NT_AMDGPU_HSA_HLDEBUG_DEBUG, SELFREF, strlen(SELFREF) + 1);
+
+    if (m_includeSource)
+    {
+        // .source
+        Elf_Scn *s = elf_newscn(m_pElf);
+        assert(s);
+        Elf_Data *d = elf_newdata(s);
+        assert(d);
+        std::string sn = ".source";
+        HSAIL_ASM::BrigSectionImpl& sec = c.sectionById(c.brigSectionIdByName("source"));
+
+        d->d_buf = sec.getData(0);
+        d->d_size = sec.secHeader()->byteCount;
+        d->d_type =  ELF_T_BYTE;
+        d->d_off = 0;
+        d->d_align = 2;
+        d->d_version = EV_CURRENT;
+
+        Elf32_Shdr *h = elf32_getshdr(s);
+        assert(h);
+        h->sh_name = m_sectionHeaderTable.addHeaderName(sn.c_str());
+        h->sh_type = SHT_NOTE;
+        h->sh_flags  = 0;
+        h->sh_addr   = 0;
+        h->sh_offset = 0;
+        h->sh_size   = d->d_size;
+        h->sh_link   = 0;
+        h->sh_info   = 0;
+        h->sh_addralign = 4;
+        h->sh_entsize = 0;
+    }
+    if (note_section_pos > 0) {
+        // .note
+        Elf_Scn *s = elf_newscn(m_pElf);
+        assert(s);
+        Elf_Data *d = elf_newdata(s);
+        assert(d);
+        std::string sn = ".note";
+
+        d->d_buf = note_section_data;
+        d->d_size = (note_section_pos + 3) & ~3;
+        d->d_type =  ELF_T_BYTE;
+        d->d_off = 0;
+        d->d_align = 2;
+        d->d_version = EV_CURRENT;
+
+        Elf32_Shdr *h = elf32_getshdr(s);
+        assert(h);
+        h->sh_name = m_sectionHeaderTable.addHeaderName(sn.c_str());
+        h->sh_type = SHT_NOTE;
+        h->sh_flags  = 0;
+        h->sh_addr   = 0;
+        h->sh_offset = 0;
+        h->sh_size   = d->d_size;
+        h->sh_link   = 0;
+        h->sh_info   = 0;
+        h->sh_addralign = 4;
+        h->sh_entsize = 0;
     }
 }
 
@@ -1359,45 +1267,8 @@ void BrigDwarfGenerator_impl::finalizeElf()
 	// note!   We can not close the m_elfFd file until we read back
 	// in the ELF disk image
 	//
-	
+
 }
-
-
-#if 0
-unsigned BrigDwarfGenerator_impl::createElfStringTable( unsigned strTabNameOffset )
-{
-    Elf_Scn * strscn = elf_newscn( m_pElf );
-    if ( ! strscn )
-        error( "Error in elf_newscn in createElfStringTable" );
-
-    Elf_Data * shstr = elf_newdata( strscn );
-    if ( ! shstr )
-        error( "Error in elf_newdata in createElfStringTable" );
-
-    shstr->d_buf = (void *) m_sectionHeaderTable.rawHeaderData();
-    shstr->d_type =  ELF_T_BYTE;
-    shstr->d_size = m_sectionHeaderTable.rawHeaderSize();
-    shstr->d_off = 0;
-    shstr->d_align = 1;
-    shstr->d_version = EV_CURRENT;
-
-    Elf32_Shdr * strshdr = elf32_getshdr( strscn );
-    if ( ! strshdr )
-        error( "error in elf32_getshdr in createElfStringTable()" );
-
-    strshdr->sh_name = strTabNameOffset;
-    strshdr->sh_type= SHT_STRTAB;
-    strshdr->sh_flags = SHF_STRINGS;
-    strshdr->sh_addr = 0;
-    strshdr->sh_offset = 0;
-    strshdr->sh_size = 0;
-    strshdr->sh_link  = 0;
-    strshdr->sh_info = 0;
-    strshdr->sh_addralign = 1;
-    strshdr->sh_entsize = 0;
-    return  elf_ndxscn(strscn);
-}
-#endif
 
 
 void BrigDwarfGenerator_impl::readElfBytesIntoContainer()
@@ -1427,8 +1298,7 @@ void BrigDwarfGenerator_impl::readElfBytesIntoContainer()
 	//
 	BDG_CLOSE( m_elfFd );
 
-	std::string outFileName( m_fileNameStr + ".dbg" );
-	BDG_UNLINK( outFileName.c_str() );
+	BDG_UNLINK( tmpFileName.c_str() );
 }
 
 

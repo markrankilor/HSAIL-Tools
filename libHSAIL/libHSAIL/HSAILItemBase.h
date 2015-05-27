@@ -1,7 +1,7 @@
 // University of Illinois/NCSA
 // Open Source License
 //
-// Copyright (c) 2013, Advanced Micro Devices, Inc.
+// Copyright (c) 2013-2015, Advanced Micro Devices, Inc.
 // All rights reserved.
 //
 // Developed by:
@@ -54,6 +54,7 @@
 
 namespace HSAIL_ASM {
 
+class BrigAccessor;
 class ItemBase;
 
 template <typename Dst, typename Src> struct copy_const { typedef Dst type; };
@@ -70,18 +71,29 @@ public:
         write(&t, sizeof(t), numBytes());
     }
 
+    void push_zeroes(size_t count) {
+        m_buffer.resize(m_buffer.size() + count);
+    }
+
     template<typename T>
     void write(T t, size_t pos) {
         write(&t, sizeof(t), pos);
     }
+
     void push_back(const void* p, unsigned n) {
         write(p, n, numBytes());
     }
+
     void write(const void* p, unsigned n, size_t pos) {
         if (numBytes() < pos + n) {
             m_buffer.resize(pos + n);
         }
         memcpy(&m_buffer[pos], p, n);
+    }
+
+    void alignBack(unsigned a) {
+        for(unsigned s = m_buffer.size() % a; s > 0; --s)
+          m_buffer.push_back(0);
     }
 
     size_t numBytes() const { return m_buffer.size(); }
@@ -407,7 +419,7 @@ public:
     int size() const {
       std::ptrdiff_t length = data().length();
       assert((length & 3) == 0);
-      return length / 4;
+      return (int)(length / 4);
     }
 
     /// @}
@@ -491,8 +503,16 @@ public:
     /// return offset of the item in the section.
     Offset brigOffset() const { return m_offset;  }
 
-    const Brig::BrigBase* brig() const { return m_section->getData<Brig::BrigBase>(m_offset); }
-    Brig::BrigBase* brig() { return m_section->getData<Brig::BrigBase>(m_offset); }
+    const BrigBase* brig() const { return m_section->getData<BrigBase>(m_offset); }
+    BrigBase* brig() { return m_section->getData<BrigBase>(m_offset); }
+
+	unsigned kind() const { return brig()->kind; }
+	unsigned byteCount() const { return brig()->byteCount; }
+
+	void initBrigBase(unsigned byteCount, unsigned kind) {
+		brig()->byteCount = byteCount;
+		brig()->kind = kind;
+	}
 
     /// return non-null if wrapper points to an item.
     operator bool_type() const { return m_offset != 0 ? &ItemBase::toCompare : NULL; }
@@ -580,7 +600,7 @@ public:
 template <typename DstItem, typename SrcItem>
 inline bool isa(SrcItem src) {
     DstItem dst = src;
-    return dst!=false;
+    return dst;
 }
 
 /// grows an item size. Item should be the last item in it's section.
