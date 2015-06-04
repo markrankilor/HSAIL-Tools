@@ -36,6 +36,11 @@ if (LIBDWARF_USE_INIT_C)
   add_definitions("-DLIBDWARF_USE_INIT_C")
 endif()
 
+# FIXME: We should check for a usable version of libelf / libdwarf.
+if(BUILD_LIBBRIGDWARF)
+  add_definitions(-DWITH_LIBBRIGDWARF=1)
+endif()
+
 if(MSVC)
   set(CMAKE_CXX_FLAGS_RELEASE "${CMAKE_CXX_FLAGS_RELEASE} /MT")
   set(CMAKE_CXX_FLAGS_DEBUG "${CMAKE_CXX_FLAGS_DEBUG} /MTd")
@@ -49,11 +54,6 @@ if(UNIX)
 endif()
 
 add_subdirectory(libHSAIL)
-
-# FIXME: We should check for a usable version of libelf / libdwarf.
-if(BUILD_LIBBRIGDWARF)
-  add_definitions(-DWITH_LIBBRIGDWARF=1)
-endif()
 
 if(BUILD_HSAILASM)
   add_subdirectory(HSAILAsm)
