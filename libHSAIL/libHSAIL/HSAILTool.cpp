@@ -355,11 +355,27 @@ bool Tool::parseOptions(const std::string& opts, bool execute)
     std::string opt;
     while (iss >> opt) {
         if (opt == "-disable-validator") { DisableValidator = true; }
+        else if (opt == "-g") {
 #ifdef WITH_LIBBRIGDWARF
-        else if (opt == "-g") { EnableDebugInfo = true; }
-        else if (opt == "-odebug") { if (!(iss >> DebugInfoFilename)) { out << "Error: Expected debug info file name after -odebug" << std::endl; return false; } }
-        else if (opt == "-include-source") { IncludeSource = true; }
+            EnableDebugInfo = true;
+#else
+			out << "Error: -g not supported." << std::endl; return false;
 #endif // WITH_LIBBRIGDWARF
+        }
+        else if (opt == "-odebug") {
+#ifdef WITH_LIBBRIGDWARF
+            if (!(iss >> DebugInfoFilename)) { out << "Error: Expected debug info file name after -odebug" << std::endl; return false; }
+#else
+			out << "Error: -odebug not supported." << std::endl; return false;
+#endif // WITH_LIBBRIGDWARF
+        }
+        else if (opt == "-include-source") {
+#ifdef WITH_LIBBRIGDWARF
+            IncludeSource = true;
+#else
+			out << "Error: -include-source not supported." << std::endl; return false;
+#endif // WITH_LIBBRIGDWARF
+        }
         else if (execute && opt == "-version") { action = VERSION; }
         else if (execute && opt == "-help") { action = HELP; }
         else if (execute && opt == "-assemble") { action = ASSEMBLE; }
